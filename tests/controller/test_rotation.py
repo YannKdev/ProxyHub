@@ -132,5 +132,4 @@ def test_rotation_is_recorded_in_history(rotate):
     hub, _ = rotate(FakeGluetun(["1.1.1.1", "2.2.2.2"]))
 
     events = [entry["event"] for entry in hub.store.history("vpn-1", 10)]
-    assert "rotation" in events
-    assert "ip" not in events
+    assert events == ["rotation"]

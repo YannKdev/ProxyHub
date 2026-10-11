@@ -210,7 +210,8 @@ class Hub:
 
         status = self.status[exit_id]
         state = "up" if ip else "down"
-        if state != status.state:
+        # Seuls les passages par "down" comptent : "up" après une rotation est attendu.
+        if state != status.state and "down" in (state, status.state):
             log.info("exit %s is %s", exit_id, state)
             self.store.add_history(exit_id, "state", {"state": state, "previous": status.state})
         if ip and ip != status.ip:

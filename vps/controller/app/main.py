@@ -18,7 +18,9 @@ log = logging.getLogger("proxyhub")
 COUNTRY_PATTERN = r"^[A-Za-z][A-Za-z .'-]{1,39}$"
 
 
-def create_app(settings: Settings | None = None, exits: dict[str, VpnExit] | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None, exits: dict[str, VpnExit] | None = None
+) -> FastAPI:
     if settings is None:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
         logging.getLogger("httpx").setLevel(logging.WARNING)

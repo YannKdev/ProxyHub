@@ -1,0 +1,10 @@
+# Une sortie = une entrée ici + un service dans docker-compose.yml.
+# proxy_port : port publié pour les clients. proxy_url : adresse interne, pour mesurer l'IP.
+exits:
+  - id: vpn-1
+    type: vpn
+    proxy_port: 8081
+    proxy_url: http://gluetun:8888
+    gluetun_control_url: http://gluetun:8000
+    cooldown_seconds: 30
+    max_attempts: 3

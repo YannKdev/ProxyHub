@@ -23,3 +23,23 @@ services:
       # Serveur de contrôle sur :8000, non publié, réservé au contrôleur.
       HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE: '{"auth":"apikey","apikey":"${GLUETUN_API_KEY:?set it in vps/.env}"}'
       TZ: ${TZ:-Europe/Paris}
+
+  controller:
+    build: ./controller
+    restart: unless-stopped
+    depends_on:
+      - gluetun
+    ports:
+      - "8090:8090"
+    environment:
+      API_TOKEN: ${API_TOKEN:?set it in vps/.env}
+      PROXY_USER: ${PROXY_USER:?set it in vps/.env}
+      PROXY_PASSWORD: ${PROXY_PASSWORD:?set it in vps/.env}
+      GLUETUN_API_KEY: ${GLUETUN_API_KEY:?set it in vps/.env}
+      TZ: ${TZ:-Europe/Paris}
+    volumes:
+      - ./config:/config:ro
+      - controller-data:/data
+
+volumes:
+  controller-data:

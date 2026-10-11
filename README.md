@@ -24,11 +24,10 @@ docker compose ps
 
 Ports à ouvrir : 80 et 443 (Caddy, certificat Let's Encrypt), 8081 (proxy VPN).
 
-Mise à jour :
+Mise à jour (pull, vérification du `.env`, reconstruction, smoke test) :
 
 ```sh
-cd ~/proxyhub && git pull
-cd vps && docker compose up -d --build
+cd ~/proxyhub/vps && ./scripts/update.sh
 ```
 
 Clé WireGuard NordVPN (jeton à générer sur my.nordaccount.com, configuration manuelle) :
@@ -41,7 +40,7 @@ curl -s -u token:<jeton> https://api.nordvpn.com/v1/users/services/credentials
 ## Vérifier
 
 ```sh
-./scripts/smoke-test.sh                                   # sur le VPS
+./scripts/smoke-test.sh                                   # sur le VPS, dans ~/proxyhub/vps
 curl -x http://<user>:<password>@<vps>:8081 https://api.ipify.org
 python client/examples/vpn_exit.py                        # PROXYHUB_HOST, PROXY_USER, PROXY_PASSWORD
 ```
@@ -99,6 +98,38 @@ hub.exits()
 
 - `hub.session` attend la fin d'une rotation en cours avant d'ouvrir la session
 - exemple complet : `client/examples/hub_example.py`
+
+## Exploitation (sur le VPS, dans `~/proxyhub/vps`)
+
+```sh
+H="Authorization: Bearer $(grep '^API_TOKEN=' .env | cut -d= -f2-)"
+docker compose ps                                         # état des conteneurs
+docker compose logs -f --tail 50 controller               # ou gluetun, caddy
+curl -s -H "$H" http://127.0.0.1:8090/exits               # API sans passer par Caddy
+curl -s -H "$H" http://127.0.0.1:8090/exits/vpn-1/history # coupures, reconnexions, rotations
+grep -E '^(API_TOKEN|PROXY_USER|PROXY_PASSWORD)=' .env    # secrets à donner aux clients
+docker compose restart gluetun                            # relancer le VPN (≈ 30 s de coupure)
+docker system df                                          # place prise par Docker
+```
+
+Changer un secret : modifier `.env`, puis `docker compose up -d`.
+
+- `PROXY_*` : Gluetun et le contrôleur redémarrent (≈ 30 s de coupure), mettre à jour les clients
+- `API_TOKEN` : seul le contrôleur redémarre, mettre à jour les clients
+- `WIREGUARD_PRIVATE_KEY` : nouvelle clé NordLynx (voir plus haut)
+
+Après un redémarrage du VPS, tout repart seul (`restart: unless-stopped`, Docker lancé au boot). La sortie peut être vue `down` pendant la première minute.
+
+## Dépannage
+
+- `vpn-1` reste `down` : `docker compose logs --tail 100 gluetun`. La reconnexion auto essaie après 2 min, puis toutes les 5 min. Sinon `docker compose restart gluetun`.
+- Gluetun « unhealthy » juste après un démarrage : il change de serveur jusqu'à ce que son contrôle passe, en général moins d'une minute.
+- L'IP ne change pas à la rotation : Gluetun est retombé sur le même serveur, `changed: false`. Relancer la rotation, ou changer de pays.
+- 429 « too many failed authentications » : IP bloquée 30 min. Attendre, ou `docker compose restart controller` (le blocage est en mémoire).
+- API injoignable en HTTPS : `docker compose logs caddy`, enregistrement DNS A vers le VPS, ports 80 et 443 ouverts. Sur le VPS : `curl http://127.0.0.1:8090/health`.
+- Certificat non renouvelé : `docker compose logs caddy | grep -i certificate`. Caddy renouvelle seul, il a besoin du port 80 ou 443.
+- `missing in .env: X` à la mise à jour : ajouter `X` (voir `.env.example`), relancer `update.sh`.
+- Une autre installation Gluetun utilise la même clé NordVPN : si deux conteneurs tombent sur le même serveur, l'un perd sa connexion. La reconnexion auto le répare.
 
 ## Tests
 

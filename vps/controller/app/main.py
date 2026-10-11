@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .config import ConfigError, Settings, load_exits, load_settings
+from .guard import Guard
 from .hub import (
     CooldownActive,
     CountryMismatch,
@@ -76,6 +77,28 @@ def create_app(
 
     def error(status: int, detail: str, **extra) -> JSONResponse:
         return JSONResponse(status_code=status, content={"detail": detail, **extra})
+
+    guard = Guard(
+        settings.auth_max_failures,
+        settings.auth_failure_window_seconds,
+        settings.auth_block_seconds,
+    )
+    app.state.guard = guard
+
+    @app.middleware("http")
+    async def block_bad_tokens(request: Request, call_next) -> Response:
+        if request.url.path == "/health":
+            return await call_next(request)
+        ip = request.client.host if request.client else "unknown"
+        blocked_for = guard.blocked_for(ip)
+        if blocked_for:
+            response = error(429, "too many failed authentications")
+            response.headers["Retry-After"] = str(blocked_for)
+            return response
+        response = await call_next(request)
+        if response.status_code == 401:
+            guard.auth_failed(ip)
+        return response
 
     @app.exception_handler(UnknownExit)
     async def unknown_exit(request: Request, exc: UnknownExit) -> JSONResponse:

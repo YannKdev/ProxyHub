@@ -42,18 +42,40 @@ services:
     logging: *logging
     depends_on:
       - gluetun
+    # Accessible seulement depuis le VPS. De l'extérieur, l'API passe par Caddy (HTTPS).
     ports:
-      - "8090:8090"
+      - "127.0.0.1:8090:8090"
     environment:
       API_TOKEN: ${API_TOKEN:?set it in vps/.env}
       PROXY_USER: ${PROXY_USER:?set it in vps/.env}
       PROXY_PASSWORD: ${PROXY_PASSWORD:?set it in vps/.env}
       GLUETUN_API_KEY: ${GLUETUN_API_KEY:?set it in vps/.env}
+      # IP du client lue dans X-Forwarded-For, posé par Caddy. Le contrôleur n'est pas joignable
+      # d'Internet, donc personne d'autre ne peut fournir cet en-tête.
+      FORWARDED_ALLOW_IPS: "*"
       TZ: ${TZ:-Europe/Paris}
     volumes:
       - ./config:/config:ro
       - controller-data:/data
 
+  caddy:
+    image: caddy:2.11.4-alpine
+    restart: unless-stopped
+    logging: *logging
+    depends_on:
+      - controller
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?set it in vps/.env}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
 volumes:
   gluetun-data:
   controller-data:
+  caddy-data:
+  caddy-config:

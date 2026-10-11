@@ -15,6 +15,9 @@ OPTIONAL_ENV = {
     "MONITOR_SECONDS": "monitor_seconds",
     "SWEEP_SECONDS": "sweep_seconds",
     "HISTORY_DAYS": "history_days",
+    "AUTH_MAX_FAILURES": "auth_max_failures",
+    "AUTH_FAILURE_WINDOW_SECONDS": "auth_failure_window_seconds",
+    "AUTH_BLOCK_SECONDS": "auth_block_seconds",
 }
 
 
@@ -33,6 +36,9 @@ class Settings(BaseModel):
     monitor_seconds: float = 60
     sweep_seconds: float = 5
     history_days: int = 7
+    auth_max_failures: int = Field(default=5, ge=1)
+    auth_failure_window_seconds: float = Field(default=600, gt=0)
+    auth_block_seconds: float = Field(default=1800, gt=0)
 
 
 class VpnExitConfig(BaseModel):

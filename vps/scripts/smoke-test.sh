@@ -49,6 +49,13 @@ else
   fail "api exits: '$exits'"
 fi
 
+if [ -n "${API_DOMAIN:-}" ]; then
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://$API_DOMAIN/health" || true)
+  [ "$code" = "200" ] && ok "api over https ($API_DOMAIN)" || fail "api over https returned $code"
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "http://$API_DOMAIN/health" || true)
+  [ "$code" = "308" ] && ok "http redirects to https" || fail "http returned $code, expected 308"
+fi
+
 session=$(curl -fsS --max-time 30 -X POST -H "$auth" "$api/exits/vpn-1/sessions" || true)
 session_id=$(echo "$session" | grep -oE '"session_id":"[a-f0-9]+"' | cut -d'"' -f4 || true)
 if [ -n "$session_id" ]; then

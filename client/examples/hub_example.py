@@ -1,11 +1,12 @@
 # Sessions et rotation avec le module client.
-# Variables d'environnement : PROXYHUB_HOST, PROXYHUB_TOKEN, PROXY_USER, PROXY_PASSWORD.
+# Variables d'environnement : PROXYHUB_URL (ex. https://api.example.com), PROXYHUB_TOKEN,
+# PROXY_USER, PROXY_PASSWORD.
 import os
 
 from proxyhub_client import ProxyHub
 
 hub = ProxyHub(
-    base_url=f"http://{os.environ['PROXYHUB_HOST']}:8090",
+    base_url=os.environ["PROXYHUB_URL"],
     token=os.environ["PROXYHUB_TOKEN"],
     proxy_user=os.environ["PROXY_USER"],
     proxy_password=os.environ["PROXY_PASSWORD"],

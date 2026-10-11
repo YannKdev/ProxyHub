@@ -7,7 +7,7 @@ Le téléphone est derrière le NAT de l'opérateur : c'est le Raspberry Pi qui 
 ```text
 scripts ──> VPS:8080 ──> tunnel SSH ──> Raspberry Pi ──> téléphone 4G    (à venir)
             VPS:8081 ──> Gluetun ──> NordVPN
-            VPS:8090 ──> API : état, IP, rotation
+            https://<domaine> ──> Caddy ──> API : état, IP, rotation
 ```
 
 ## Installation (VPS)
@@ -17,10 +17,12 @@ git clone https://github.com/YannKdev/ProxyHub.git proxyhub
 cd proxyhub/vps
 cp .env.example .env
 openssl rand -hex 32          # un secret par valeur vide du .env
-nano .env
+nano .env                     # API_DOMAIN : sous-domaine avec un enregistrement A vers le VPS
 docker compose up -d --build
 docker compose ps
 ```
+
+Ports à ouvrir : 80 et 443 (Caddy, certificat Let's Encrypt), 8081 (proxy VPN).
 
 Mise à jour :
 
@@ -48,7 +50,7 @@ python client/examples/vpn_exit.py                        # PROXYHUB_HOST, PROXY
 
 ```sh
 TOKEN=<API_TOKEN du .env>
-API=http://<vps>:8090
+API=https://<API_DOMAIN>                                  # sur le VPS : http://127.0.0.1:8090
 H="Authorization: Bearer $TOKEN"
 
 curl $API/health                                          # sans jeton
@@ -67,7 +69,7 @@ curl -H "$H" -X DELETE $API/sessions/<session_id>         # ferme la session
 
 - rotate : 202 + `operation_id`, `changed: false` si l'IP n'a pas bougé après `max_attempts`
 - 409 : opération en cours (`operation_id`), sessions ouvertes (`active_sessions`), autre pays (`country`)
-- 429 : délai minimal (`Retry-After`)
+- 429 : délai minimal, ou IP bloquée 30 min après 5 mauvais jetons (`Retry-After`)
 - session : expire seule après `session_ttl_seconds`, pas de rotation tant qu'une session est ouverte
 - rotation auto : `rotate_every_sessions: N` dans `vps/config/exits.yaml`
 - reconnexion auto : sortie `down` depuis 2 min → le contrôleur relance le VPN (au plus toutes les 5 min), état `recovering`
@@ -82,7 +84,7 @@ pip install "git+https://github.com/YannKdev/ProxyHub#subdirectory=client"
 ```python
 from proxyhub_client import ProxyHub
 
-hub = ProxyHub("http://<vps>:8090", token="...", proxy_user="...", proxy_password="...")
+hub = ProxyHub("https://<API_DOMAIN>", token="...", proxy_user="...", proxy_password="...")
 
 with hub.session("vpn-1") as s:                    # requests.Session qui sort par vpn-1
     s.get("https://example.org")
@@ -108,7 +110,8 @@ ruff check . && ruff format --check .
 
 ## Notes
 
-- HTTP simple : identifiants proxy et jeton API en clair sur le réseau
+- API en HTTPS (Caddy), port 8090 joignable seulement depuis le VPS
+- proxys en HTTP simple : leurs identifiants passent en clair sur le réseau
 - Docker contourne ufw : `ufw deny` ne ferme pas les ports publiés
 - serveur de contrôle Gluetun (8000) non publié, clé d'API
 - pas d'en-têtes de proxy ajoutés (`HTTPPROXY_STEALTH`)

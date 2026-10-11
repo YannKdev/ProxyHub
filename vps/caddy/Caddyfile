@@ -1,0 +1,4 @@
+# HTTPS de l'API. Certificat Let's Encrypt obtenu et renouvelé par Caddy.
+{$API_DOMAIN} {
+	reverse_proxy controller:8090
+}

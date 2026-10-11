@@ -135,7 +135,7 @@ def test_auto_rotation_waits_for_cooldown(new_hub):
         hub.close_session(session["session_id"])
         during_cooldown = "vpn-1" in hub.running
         hub.store.save_rotation_time("vpn-1", utcnow() - timedelta(seconds=90))
-        hub.sweep_sessions()
+        hub.sweep()
         after_cooldown = "vpn-1" in hub.running
         await hub.wait_operations()
         return during_cooldown, after_cooldown
@@ -153,7 +153,7 @@ def test_expired_sessions_count_for_auto_rotation(new_hub):
         await hub.check_all()
         session = await hub.open_session("vpn-1")
         await asyncio.sleep(0.02)
-        hub.sweep_sessions()
+        hub.sweep()
         started = "vpn-1" in hub.running
         await hub.wait_operations()
         return hub.store.session(session["session_id"]), started
@@ -169,7 +169,7 @@ def test_no_auto_rotation_without_setting(new_hub):
         for _ in range(5):
             session = await hub.open_session("vpn-1")
             hub.close_session(session["session_id"])
-        hub.sweep_sessions()
+        hub.sweep()
         return "vpn-1" in hub.running
 
     assert run(scenario()) is False

@@ -48,7 +48,7 @@ def create_app(
         loops = []
         if settings.monitor_seconds > 0:
             loops.append(asyncio.create_task(hub.monitor()))
-        if settings.session_sweep_seconds > 0:
+        if settings.sweep_seconds > 0:
             loops.append(asyncio.create_task(hub.sweeper()))
         yield
         for task in loops:

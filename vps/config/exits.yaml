@@ -2,6 +2,8 @@
 # proxy_port : port publié pour les clients. proxy_url : adresse interne, pour mesurer l'IP.
 # rotate_every_sessions : rotation automatique après N sessions fermées (absent = jamais).
 # session_ttl_seconds : durée de vie d'une session non fermée (900 par défaut).
+# recover_after_seconds : reconnexion automatique après N s en "down" (120 par défaut, null = jamais).
+# recover_interval_seconds : délai minimal entre deux reconnexions automatiques (300 par défaut).
 exits:
   - id: vpn-1
     type: vpn

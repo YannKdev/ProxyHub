@@ -1,20 +1,32 @@
 name: proxyhub
 
+# Journaux Docker limités à 3 fichiers de 10 Mo par conteneur.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   gluetun:
     image: qmcgaw/gluetun:v3.41.3
     restart: unless-stopped
+    logging: *logging
     cap_add:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
     ports:
       - "8081:8888"
+    volumes:
+      - gluetun-data:/gluetun
     environment:
       VPN_SERVICE_PROVIDER: nordvpn
       VPN_TYPE: wireguard
       WIREGUARD_PRIVATE_KEY: ${WIREGUARD_PRIVATE_KEY:?set it in vps/.env}
       SERVER_COUNTRIES: ${SERVER_COUNTRIES:-}
+      # Liste des serveurs NordVPN remise à jour chaque jour, gardée dans le volume.
+      UPDATER_PERIOD: 24h
       HTTPPROXY: "on"
       HTTPPROXY_USER: ${PROXY_USER:?set it in vps/.env}
       HTTPPROXY_PASSWORD: ${PROXY_PASSWORD:?set it in vps/.env}
@@ -27,6 +39,7 @@ services:
   controller:
     build: ./controller
     restart: unless-stopped
+    logging: *logging
     depends_on:
       - gluetun
     ports:
@@ -42,4 +55,5 @@ services:
       - controller-data:/data
 
 volumes:
+  gluetun-data:
   controller-data:

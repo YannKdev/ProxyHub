@@ -2,8 +2,10 @@ import asyncio
 import logging
 import math
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from functools import partial
 from typing import Any
 
 from .config import Settings
@@ -11,6 +13,9 @@ from .store import Store, utcnow
 from .vpn import ExitError, VpnExit
 
 log = logging.getLogger("proxyhub")
+
+# État affiché pendant une opération.
+BUSY_STATE = {"rotate": "rotating", "recover": "recovering"}
 
 
 class UnknownExit(Exception):
@@ -47,10 +52,13 @@ class CooldownActive(Exception):
 
 @dataclass
 class ExitStatus:
+    # Santé mesurée : unknown, up ou down. Une opération en cours s'affiche à part.
     state: str = "unknown"
     ip: str | None = None
     country: str | None = None
     checked_at: str | None = None
+    down_since: float | None = None
+    last_recovery: float | None = None
 
 
 def same_country(a: str | None, b: str | None) -> bool:
@@ -64,6 +72,7 @@ class Hub:
         self.store = store
         self.status = {exit_id: ExitStatus() for exit_id in exits}
         self.running: dict[str, str] = {}
+        self.busy_state: dict[str, str] = {}
         self._tasks: set[asyncio.Task] = set()
 
     def startup(self) -> None:
@@ -92,7 +101,7 @@ class Hub:
         return {
             "id": exit_id,
             "type": config.type,
-            "state": status.state,
+            "state": self.busy_state.get(exit_id, status.state),
             "ip": status.ip,
             "country": status.country,
             "proxy_port": config.proxy_port,
@@ -139,20 +148,6 @@ class Hub:
             self._maybe_auto_rotate(session["exit"])
         return session
 
-    def sweep_sessions(self) -> None:
-        for exit_id in self.store.expire_sessions():
-            log.info("session expired exit=%s", exit_id)
-        for exit_id in self.exits:
-            self._maybe_auto_rotate(exit_id)
-
-    async def sweeper(self) -> None:
-        while True:
-            try:
-                self.sweep_sessions()
-            except Exception:
-                log.exception("session sweep failed")
-            await asyncio.sleep(self.settings.session_sweep_seconds)
-
     def _sessions_since_rotation(self, exit_id: str) -> int:
         last = self.store.exit_row(exit_id)["last_rotation_at"]
         return self.store.closed_sessions_since(exit_id, last)
@@ -168,9 +163,41 @@ class Hub:
         # Délai minimal pas encore écoulé : le prochain balayage réessaiera.
         if self._cooldown_left(exit_id) > 0:
             return
-        self._launch_rotation(exit_id, None, trigger="auto")
+        self._launch(exit_id, "rotate", {"country": None, "trigger": "auto"})
 
-    # Rotations
+    # Balayage : expiration des sessions, rotation automatique, reconnexion
+
+    def sweep(self) -> None:
+        for exit_id in self.store.expire_sessions():
+            log.info("session expired exit=%s", exit_id)
+        for exit_id in self.exits:
+            self._maybe_auto_rotate(exit_id)
+            self._maybe_recover(exit_id)
+
+    async def sweeper(self) -> None:
+        while True:
+            try:
+                self.sweep()
+            except Exception:
+                log.exception("sweep failed")
+            await asyncio.sleep(self.settings.sweep_seconds)
+
+    def _maybe_recover(self, exit_id: str) -> None:
+        config = self.exits[exit_id].config
+        status = self.status[exit_id]
+        if config.recover_after_seconds is None or exit_id in self.running:
+            return
+        if status.state != "down" or status.down_since is None:
+            return
+        now = time.monotonic()
+        if now - status.down_since < config.recover_after_seconds:
+            return
+        if status.last_recovery and now - status.last_recovery < config.recover_interval_seconds:
+            return
+        status.last_recovery = now
+        self._launch(exit_id, "recover", {"trigger": "auto"})
+
+    # Opérations
 
     def _cooldown_left(self, exit_id: str) -> float:
         last = self.store.exit_row(exit_id)["last_rotation_at"]
@@ -191,22 +218,18 @@ class Hub:
         wait = self._cooldown_left(exit_id)
         if wait > 0:
             raise CooldownActive(math.ceil(wait))
-        return self._launch_rotation(exit_id, country, trigger="api")
+        return self._launch(exit_id, "rotate", {"country": country, "trigger": "api"})
 
-    def _launch_rotation(self, exit_id: str, country: str | None, trigger: str) -> dict[str, Any]:
-        op = self.store.create_operation(
-            "rotate", exit_id, {"country": country, "trigger": trigger}
-        )
+    def _launch(self, exit_id: str, op_type: str, params: dict) -> dict[str, Any]:
+        op = self.store.create_operation(op_type, exit_id, params)
         self.running[exit_id] = op["id"]
-        self.status[exit_id].state = "rotating"
-        log.info(
-            "rotation started exit=%s country=%s trigger=%s operation=%s",
-            exit_id,
-            country,
-            trigger,
-            op["id"],
-        )
-        task = asyncio.create_task(self._run_rotation(exit_id, op["id"], country))
+        self.busy_state[exit_id] = BUSY_STATE[op_type]
+        log.info("%s started exit=%s params=%s operation=%s", op_type, exit_id, params, op["id"])
+        if op_type == "rotate":
+            work = partial(self._rotate, exit_id, params["country"])
+        else:
+            work = partial(self._recover, exit_id)
+        task = asyncio.create_task(self._run(exit_id, op, work))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return op
@@ -215,28 +238,27 @@ class Hub:
         while self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
 
-    async def _run_rotation(self, exit_id: str, op_id: str, country: str | None) -> None:
+    async def _run(
+        self, exit_id: str, op: dict, work: Callable[[], Awaitable[dict[str, Any]]]
+    ) -> None:
+        event = "rotation" if op["type"] == "rotate" else "recovery"
         try:
-            result = await self._rotate(exit_id, country)
+            result = await work()
         except Exception as e:
             error = str(e) or type(e).__name__
-            log.warning("rotation failed exit=%s error=%s", exit_id, error)
-            self.store.finish_operation(op_id, "failed", error=error)
-            self.store.add_history(exit_id, "rotation", {"error": error})
+            log.warning("%s failed exit=%s error=%s", op["type"], exit_id, error)
+            self.store.finish_operation(op["id"], "failed", error=error)
+            self.store.add_history(exit_id, event, {"error": error})
         else:
-            log.info(
-                "rotation done exit=%s changed=%s attempts=%s duration=%ss",
-                exit_id,
-                result["changed"],
-                result["attempts"],
-                result["duration_seconds"],
-            )
-            self.store.finish_operation(op_id, "done", result=result)
-            self.store.add_history(exit_id, "rotation", result)
+            log.info("%s done exit=%s result=%s", op["type"], exit_id, result)
+            self.store.finish_operation(op["id"], "done", result=result)
+            self.store.add_history(exit_id, event, result)
             self.status[exit_id].ip = result["new_ip"]
             self.store.save_ip(exit_id, result["new_ip"])
-        self.store.save_rotation_time(exit_id, utcnow())
+        if op["type"] == "rotate":
+            self.store.save_rotation_time(exit_id, utcnow())
         del self.running[exit_id]
+        del self.busy_state[exit_id]
         await self._check(exit_id)
 
     async def _rotate(self, exit_id: str, country: str | None) -> dict[str, Any]:
@@ -254,7 +276,7 @@ class Hub:
         while attempts < driver.config.max_attempts:
             attempts += 1
             await driver.reconnect(switch if attempts == 1 else None)
-            new_ip = await self._wait_for_new_ip(driver, old_ip)
+            new_ip = await self._wait_for_ip(driver, old_ip)
             if new_ip and new_ip != old_ip:
                 break
         if new_ip is None:
@@ -270,7 +292,23 @@ class Hub:
             "duration_seconds": round(time.monotonic() - started, 1),
         }
 
-    async def _wait_for_new_ip(self, driver: VpnExit, old_ip: str | None) -> str | None:
+    async def _recover(self, exit_id: str) -> dict[str, Any]:
+        # Il suffit que la sortie remarche : une IP différente n'est pas exigée.
+        driver = self.exits[exit_id]
+        started = time.monotonic()
+        await driver.reconnect()
+        new_ip = await self._wait_for_ip(driver, None)
+        if new_ip is None:
+            raise ExitError("exit did not come back after reconnecting")
+        return {
+            "exit": exit_id,
+            "old_ip": self.status[exit_id].ip,
+            "new_ip": new_ip,
+            "duration_seconds": round(time.monotonic() - started, 1),
+        }
+
+    async def _wait_for_ip(self, driver: VpnExit, old_ip: str | None) -> str | None:
+        """Mesure jusqu'à obtenir une IP différente de `old_ip`, ou jusqu'au délai."""
         deadline = time.monotonic() + driver.config.ready_timeout_seconds
         last_ip = None
         while True:
@@ -317,16 +355,20 @@ class Hub:
             country = await driver.country()
         except Exception:
             country = None
-        # Une rotation en cours gère elle-même l'état de la sortie.
+        # Une opération en cours gère elle-même l'état de la sortie.
         if exit_id in self.running:
             return ip
 
         status = self.status[exit_id]
         state = "up" if ip else "down"
-        # Seuls les passages par "down" comptent : "up" après une rotation est attendu.
+        # Seuls les passages par "down" comptent : unknown -> up au démarrage est attendu.
         if state != status.state and "down" in (state, status.state):
             log.info("exit %s is %s", exit_id, state)
             self.store.add_history(exit_id, "state", {"state": state, "previous": status.state})
+        if state == "down" and status.down_since is None:
+            status.down_since = time.monotonic()
+        if state == "up":
+            status.down_since = None
         if ip and ip != status.ip:
             self.store.add_history(exit_id, "ip", {"ip": ip, "previous": status.ip})
             self.store.save_ip(exit_id, ip)

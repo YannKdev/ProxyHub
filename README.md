@@ -70,6 +70,8 @@ curl -H "$H" -X DELETE $API/sessions/<session_id>         # ferme la session
 - 429 : délai minimal (`Retry-After`)
 - session : expire seule après `session_ttl_seconds`, pas de rotation tant qu'une session est ouverte
 - rotation auto : `rotate_every_sessions: N` dans `vps/config/exits.yaml`
+- reconnexion auto : sortie `down` depuis 2 min → le contrôleur relance le VPN (au plus toutes les 5 min), état `recovering`
+- états : `up`, `down`, `rotating`, `recovering`
 
 ## Client Python
 
@@ -110,6 +112,8 @@ ruff check . && ruff format --check .
 - Docker contourne ufw : `ufw deny` ne ferme pas les ports publiés
 - serveur de contrôle Gluetun (8000) non publié, clé d'API
 - pas d'en-têtes de proxy ajoutés (`HTTPPROXY_STEALTH`)
+- liste des serveurs NordVPN mise à jour chaque jour (`UPDATER_PERIOD`, volume `gluetun-data`)
+- journaux Docker : 3 × 10 Mo max par conteneur
 
 ## Licence
 

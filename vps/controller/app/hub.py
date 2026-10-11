@@ -18,7 +18,25 @@ class UnknownExit(Exception):
 
 
 class ExitBusy(Exception):
+    def __init__(self, operation_id: str):
+        super().__init__(operation_id)
+        self.operation_id = operation_id
+
+
+class ExitInUse(Exception):
+    def __init__(self, active_sessions: int):
+        super().__init__(f"{active_sessions} active sessions")
+        self.active_sessions = active_sessions
+
+
+class ExitDown(Exception):
     pass
+
+
+class CountryMismatch(Exception):
+    def __init__(self, current: str):
+        super().__init__(current)
+        self.current = current
 
 
 class CooldownActive(Exception):
@@ -33,6 +51,10 @@ class ExitStatus:
     ip: str | None = None
     country: str | None = None
     checked_at: str | None = None
+
+
+def same_country(a: str | None, b: str | None) -> bool:
+    return (a or "").casefold() == (b or "").casefold()
 
 
 class Hub:
@@ -77,32 +99,121 @@ class Hub:
             "last_rotation_at": self.store.exit_row(exit_id)["last_rotation_at"],
             "checked_at": status.checked_at,
             "operation_id": self.running.get(exit_id),
+            "active_sessions": self.store.active_sessions(exit_id),
+            "sessions_since_rotation": self._sessions_since_rotation(exit_id),
+            "rotate_every_sessions": config.rotate_every_sessions,
         }
 
     def describe_all(self) -> list[dict[str, Any]]:
         return [self.describe(exit_id) for exit_id in self.exits]
 
-    def start_rotation(self, exit_id: str, country: str | None = None) -> dict[str, Any]:
+    # Sessions
+
+    async def open_session(self, exit_id: str, country: str | None = None) -> dict[str, Any]:
         config = self.driver(exit_id).config
         if exit_id in self.running:
-            raise ExitBusy(exit_id)
-        last = self.store.exit_row(exit_id)["last_rotation_at"]
-        if last:
-            elapsed = (utcnow() - datetime.fromisoformat(last)).total_seconds()
-            if elapsed < config.cooldown_seconds:
-                raise CooldownActive(math.ceil(config.cooldown_seconds - elapsed))
+            raise ExitBusy(self.running[exit_id])
+        status = self.status[exit_id]
+        if status.checked_at is None:
+            await self._check(exit_id)
+        if status.state == "down":
+            raise ExitDown(exit_id)
+        if country and status.country and not same_country(country, status.country):
+            raise CountryMismatch(status.country)
 
-        op = self.store.create_operation("rotate", exit_id, {"country": country})
+        session = self.store.open_session(exit_id, config.session_ttl_seconds)
+        log.info("session opened exit=%s session=%s", exit_id, session["id"])
+        return {
+            "session_id": session["id"],
+            "exit": exit_id,
+            "proxy_port": config.proxy_port,
+            "ip": status.ip,
+            "country": status.country,
+            "expires_at": session["expires_at"],
+        }
+
+    def close_session(self, session_id: str) -> dict[str, Any] | None:
+        session = self.store.close_session(session_id)
+        if session:
+            log.info("session closed exit=%s session=%s", session["exit"], session_id)
+            self._maybe_auto_rotate(session["exit"])
+        return session
+
+    def sweep_sessions(self) -> None:
+        for exit_id in self.store.expire_sessions():
+            log.info("session expired exit=%s", exit_id)
+        for exit_id in self.exits:
+            self._maybe_auto_rotate(exit_id)
+
+    async def sweeper(self) -> None:
+        while True:
+            try:
+                self.sweep_sessions()
+            except Exception:
+                log.exception("session sweep failed")
+            await asyncio.sleep(self.settings.session_sweep_seconds)
+
+    def _sessions_since_rotation(self, exit_id: str) -> int:
+        last = self.store.exit_row(exit_id)["last_rotation_at"]
+        return self.store.closed_sessions_since(exit_id, last)
+
+    def _maybe_auto_rotate(self, exit_id: str) -> None:
+        every = self.exits[exit_id].config.rotate_every_sessions
+        if not every or exit_id in self.running:
+            return
+        if self.store.active_sessions(exit_id):
+            return
+        if self._sessions_since_rotation(exit_id) < every:
+            return
+        # Délai minimal pas encore écoulé : le prochain balayage réessaiera.
+        if self._cooldown_left(exit_id) > 0:
+            return
+        self._launch_rotation(exit_id, None, trigger="auto")
+
+    # Rotations
+
+    def _cooldown_left(self, exit_id: str) -> float:
+        last = self.store.exit_row(exit_id)["last_rotation_at"]
+        if not last:
+            return 0
+        elapsed = (utcnow() - datetime.fromisoformat(last)).total_seconds()
+        return self.exits[exit_id].config.cooldown_seconds - elapsed
+
+    def start_rotation(
+        self, exit_id: str, country: str | None = None, force: bool = False
+    ) -> dict[str, Any]:
+        self.driver(exit_id)
+        if exit_id in self.running:
+            raise ExitBusy(self.running[exit_id])
+        active = self.store.active_sessions(exit_id)
+        if active and not force:
+            raise ExitInUse(active)
+        wait = self._cooldown_left(exit_id)
+        if wait > 0:
+            raise CooldownActive(math.ceil(wait))
+        return self._launch_rotation(exit_id, country, trigger="api")
+
+    def _launch_rotation(self, exit_id: str, country: str | None, trigger: str) -> dict[str, Any]:
+        op = self.store.create_operation(
+            "rotate", exit_id, {"country": country, "trigger": trigger}
+        )
         self.running[exit_id] = op["id"]
         self.status[exit_id].state = "rotating"
-        log.info("rotation started exit=%s country=%s operation=%s", exit_id, country, op["id"])
+        log.info(
+            "rotation started exit=%s country=%s trigger=%s operation=%s",
+            exit_id,
+            country,
+            trigger,
+            op["id"],
+        )
         task = asyncio.create_task(self._run_rotation(exit_id, op["id"], country))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return op
 
     async def wait_operations(self) -> None:
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        while self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
 
     async def _run_rotation(self, exit_id: str, op_id: str, country: str | None) -> None:
         try:
@@ -136,7 +247,7 @@ class Hub:
         except Exception:
             old_ip = self.status[exit_id].ip
         current = await driver.country()
-        switch = country if country and country.casefold() != (current or "").casefold() else None
+        switch = country if country and not same_country(country, current) else None
 
         new_ip = None
         attempts = 0
@@ -174,6 +285,8 @@ class Hub:
             if time.monotonic() >= deadline:
                 return last_ip
             await asyncio.sleep(driver.config.poll_seconds)
+
+    # Surveillance
 
     async def monitor(self) -> None:
         while True:

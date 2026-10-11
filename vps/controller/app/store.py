@@ -2,7 +2,7 @@ import json
 import sqlite3
 import threading
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,15 @@ CREATE TABLE IF NOT EXISTS history (
     data TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS history_exit_at ON history (exit_id, at);
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    exit_id TEXT NOT NULL,
+    opened_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    closed_at TEXT,
+    close_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS sessions_exit ON sessions (exit_id, closed_at);
 """
 
 
@@ -126,9 +135,62 @@ class Store:
         )
         return [{"at": row["at"], "event": row["event"], **json.loads(row["data"])} for row in rows]
 
+    def open_session(self, exit_id: str, ttl_seconds: float) -> dict[str, Any]:
+        session_id = uuid.uuid4().hex
+        now = utcnow()
+        self._execute(
+            "INSERT INTO sessions (id, exit_id, opened_at, expires_at) VALUES (?, ?, ?, ?)",
+            (
+                session_id,
+                exit_id,
+                now.isoformat(),
+                (now + timedelta(seconds=ttl_seconds)).isoformat(),
+            ),
+        )
+        return self.session(session_id)
+
+    def session(self, session_id: str) -> dict[str, Any] | None:
+        rows = self._execute("SELECT * FROM sessions WHERE id = ?", (session_id,))
+        if not rows:
+            return None
+        row = dict(rows[0])
+        row["exit"] = row.pop("exit_id")
+        return row
+
+    def close_session(self, session_id: str) -> dict[str, Any] | None:
+        self._execute(
+            "UPDATE sessions SET closed_at = ?, close_reason = 'closed' "
+            "WHERE id = ? AND closed_at IS NULL",
+            (utcnow().isoformat(), session_id),
+        )
+        return self.session(session_id)
+
+    def expire_sessions(self) -> list[str]:
+        now = utcnow().isoformat()
+        rows = self._execute(
+            "UPDATE sessions SET closed_at = ?, close_reason = 'expired' "
+            "WHERE closed_at IS NULL AND expires_at < ? RETURNING exit_id",
+            (now, now),
+        )
+        return [row["exit_id"] for row in rows]
+
+    def active_sessions(self, exit_id: str) -> int:
+        rows = self._execute(
+            "SELECT COUNT(*) FROM sessions WHERE exit_id = ? AND closed_at IS NULL", (exit_id,)
+        )
+        return rows[0][0]
+
+    def closed_sessions_since(self, exit_id: str, since: str | None) -> int:
+        rows = self._execute(
+            "SELECT COUNT(*) FROM sessions WHERE exit_id = ? AND closed_at > ?",
+            (exit_id, since or ""),
+        )
+        return rows[0][0]
+
     def purge(self, before: datetime) -> None:
         self._execute("DELETE FROM history WHERE at < ?", (before.isoformat(),))
         self._execute(
             "DELETE FROM operations WHERE status != 'running' AND started_at < ?",
             (before.isoformat(),),
         )
+        self._execute("DELETE FROM sessions WHERE closed_at < ?", (before.isoformat(),))

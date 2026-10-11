@@ -1,5 +1,7 @@
 # Une sortie = une entrée ici + un service dans docker-compose.yml.
 # proxy_port : port publié pour les clients. proxy_url : adresse interne, pour mesurer l'IP.
+# rotate_every_sessions : rotation automatique après N sessions fermées (absent = jamais).
+# session_ttl_seconds : durée de vie d'une session non fermée (900 par défaut).
 exits:
   - id: vpn-1
     type: vpn
@@ -8,3 +10,5 @@ exits:
     gluetun_control_url: http://gluetun:8000
     cooldown_seconds: 30
     max_attempts: 3
+    # rotate_every_sessions: 5
+    # session_ttl_seconds: 900

@@ -41,11 +41,21 @@ code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$api/health" || tru
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$api/exits" || true)
 [ "$code" = "401" ] && ok "api rejects requests without token" || fail "api without token returned $code"
 
-exits=$(curl -fsS --max-time 30 -H "Authorization: Bearer $API_TOKEN" "$api/exits" || true)
+auth="Authorization: Bearer $API_TOKEN"
+exits=$(curl -fsS --max-time 30 -H "$auth" "$api/exits" || true)
 if echo "$exits" | grep -q '"id":"vpn-1"'; then
   ok "api lists vpn-1: $(echo "$exits" | grep -oE '"state":"[a-z]+"' | head -1)"
 else
   fail "api exits: '$exits'"
+fi
+
+session=$(curl -fsS --max-time 30 -X POST -H "$auth" "$api/exits/vpn-1/sessions" || true)
+session_id=$(echo "$session" | grep -oE '"session_id":"[a-f0-9]+"' | cut -d'"' -f4)
+if [ -n "$session_id" ]; then
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "$auth" "$api/sessions/$session_id")
+  [ "$code" = "204" ] && ok "api session open and close" || fail "api session close returned $code"
+else
+  fail "api session open: '$session'"
 fi
 
 exit $failed

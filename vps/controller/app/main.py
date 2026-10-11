@@ -4,18 +4,26 @@ import secrets
 from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .config import ConfigError, Settings, load_exits, load_settings
-from .hub import CooldownActive, ExitBusy, Hub, UnknownExit
+from .hub import (
+    CooldownActive,
+    CountryMismatch,
+    ExitBusy,
+    ExitDown,
+    ExitInUse,
+    Hub,
+    UnknownExit,
+)
 from .store import Store
 from .vpn import VpnExit, make_vpn_exit
 
 log = logging.getLogger("proxyhub")
 
-COUNTRY_PATTERN = r"^[A-Za-z][A-Za-z .'-]{1,39}$"
+Country = Annotated[str | None, Query(pattern=r"^[A-Za-z][A-Za-z .'-]{1,39}$")]
 
 
 def create_app(
@@ -37,10 +45,14 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         hub.startup()
-        monitor = asyncio.create_task(hub.monitor()) if settings.monitor_seconds > 0 else None
+        loops = []
+        if settings.monitor_seconds > 0:
+            loops.append(asyncio.create_task(hub.monitor()))
+        if settings.session_sweep_seconds > 0:
+            loops.append(asyncio.create_task(hub.sweeper()))
         yield
-        if monitor:
-            monitor.cancel()
+        for task in loops:
+            task.cancel()
         await hub.close()
 
     app = FastAPI(
@@ -62,23 +74,42 @@ def create_app(
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
+    def error(status: int, detail: str, **extra) -> JSONResponse:
+        return JSONResponse(status_code=status, content={"detail": detail, **extra})
+
     @app.exception_handler(UnknownExit)
     async def unknown_exit(request: Request, exc: UnknownExit) -> JSONResponse:
-        return JSONResponse(status_code=404, content={"detail": "unknown exit"})
+        return error(404, "unknown exit")
 
     @app.exception_handler(ExitBusy)
     async def exit_busy(request: Request, exc: ExitBusy) -> JSONResponse:
-        return JSONResponse(
-            status_code=409, content={"detail": "an operation is already running on this exit"}
+        return error(
+            409, "an operation is already running on this exit", operation_id=exc.operation_id
         )
+
+    @app.exception_handler(ExitInUse)
+    async def exit_in_use(request: Request, exc: ExitInUse) -> JSONResponse:
+        return error(
+            409,
+            f"exit has {exc.active_sessions} active sessions, use force=true to rotate anyway",
+            active_sessions=exc.active_sessions,
+        )
+
+    @app.exception_handler(CountryMismatch)
+    async def country_mismatch(request: Request, exc: CountryMismatch) -> JSONResponse:
+        return error(
+            409, f"exit is in {exc.current}, rotate with ?country= first", country=exc.current
+        )
+
+    @app.exception_handler(ExitDown)
+    async def exit_down(request: Request, exc: ExitDown) -> JSONResponse:
+        return error(503, "exit is down")
 
     @app.exception_handler(CooldownActive)
     async def cooldown(request: Request, exc: CooldownActive) -> JSONResponse:
-        return JSONResponse(
-            status_code=429,
-            content={"detail": f"cooldown active, retry in {exc.retry_after} s"},
-            headers={"Retry-After": str(exc.retry_after)},
-        )
+        response = error(429, f"cooldown active, retry in {exc.retry_after} s")
+        response.headers["Retry-After"] = str(exc.retry_after)
+        return response
 
     @app.get("/health")
     async def health() -> dict:
@@ -98,11 +129,8 @@ def create_app(
         return {"exit": exit_id, "ip": ip}
 
     @api.post("/exits/{exit_id}/rotate", status_code=202)
-    async def rotate(
-        exit_id: str,
-        country: Annotated[str | None, Query(pattern=COUNTRY_PATTERN)] = None,
-    ) -> dict:
-        op = hub.start_rotation(exit_id, country)
+    async def rotate(exit_id: str, country: Country = None, force: bool = False) -> dict:
+        op = hub.start_rotation(exit_id, country, force)
         return {"operation_id": op["id"], "status": op["status"]}
 
     @api.get("/operations/{operation_id}")
@@ -118,6 +146,18 @@ def create_app(
     ) -> list[dict]:
         hub.driver(exit_id)
         return hub.store.history(exit_id, limit)
+
+    @api.post("/exits/{exit_id}/sessions", status_code=201)
+    async def open_session(request: Request, exit_id: str, country: Country = None) -> dict:
+        session = await hub.open_session(exit_id, country)
+        session["proxy_url"] = f"http://{request.url.hostname}:{session['proxy_port']}"
+        return session
+
+    @api.delete("/sessions/{session_id}", status_code=204)
+    async def close_session(session_id: str) -> Response:
+        if hub.close_session(session_id) is None:
+            raise HTTPException(status_code=404, detail="unknown session")
+        return Response(status_code=204)
 
     app.include_router(api)
     return app

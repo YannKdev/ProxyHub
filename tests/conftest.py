@@ -9,6 +9,11 @@ API_TOKEN = "t" * 40
 
 
 @pytest.fixture
+def api_token() -> str:
+    return API_TOKEN
+
+
+@pytest.fixture
 def auth() -> dict[str, str]:
     return {"Authorization": f"Bearer {API_TOKEN}"}
 
@@ -22,6 +27,7 @@ def settings(tmp_path) -> Settings:
         gluetun_api_key="gluetun-key",
         db_path=tmp_path / "proxyhub.db",
         monitor_seconds=0,
+        session_sweep_seconds=0,
     )
 
 

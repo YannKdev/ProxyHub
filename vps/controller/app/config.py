@@ -13,6 +13,7 @@ OPTIONAL_ENV = {
     "EXITS_FILE": "exits_file",
     "DB_PATH": "db_path",
     "MONITOR_SECONDS": "monitor_seconds",
+    "SESSION_SWEEP_SECONDS": "session_sweep_seconds",
     "HISTORY_DAYS": "history_days",
 }
 
@@ -30,6 +31,7 @@ class Settings(BaseModel):
     exits_file: Path = Path("/config/exits.yaml")
     db_path: Path = Path("/data/proxyhub.db")
     monitor_seconds: float = 60
+    session_sweep_seconds: float = 5
     history_days: int = 7
 
 
@@ -45,6 +47,8 @@ class VpnExitConfig(BaseModel):
     max_attempts: int = Field(default=3, ge=1)
     ready_timeout_seconds: float = 90
     poll_seconds: float = 3
+    rotate_every_sessions: int | None = Field(default=None, ge=1)
+    session_ttl_seconds: float = Field(default=900, gt=0)
 
 
 class ExitsFile(BaseModel):

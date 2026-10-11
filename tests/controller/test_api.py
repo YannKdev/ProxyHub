@@ -63,7 +63,7 @@ def test_rotation_flow(client, auth):
     op = wait_for(client, auth, response.json()["operation_id"])
     assert op["status"] == "done"
     assert op["result"]["new_ip"] == "2.2.2.2"
-    assert op["params"] == {"country": "Belgium"}
+    assert op["params"] == {"country": "Belgium", "trigger": "api"}
 
     vpn = client.get("/exits", headers=auth).json()[0]
     assert vpn["ip"] == "2.2.2.2"
@@ -94,3 +94,51 @@ def test_invalid_country_is_rejected(client, auth, country):
 
 def test_unknown_operation(client, auth):
     assert client.get("/operations/nope", headers=auth).status_code == 404
+
+
+def test_session_lifecycle(client, auth):
+    response = client.post("/exits/vpn-1/sessions", headers=auth)
+    assert response.status_code == 201
+    session = response.json()
+    assert session["proxy_url"] == "http://testserver:8081"
+    assert session["expires_at"]
+    assert client.get("/exits", headers=auth).json()[0]["active_sessions"] == 1
+
+    assert client.delete(f"/sessions/{session['session_id']}", headers=auth).status_code == 204
+    vpn = client.get("/exits", headers=auth).json()[0]
+    assert vpn["active_sessions"] == 0
+    assert vpn["sessions_since_rotation"] == 1
+
+
+def test_close_unknown_session(client, auth):
+    assert client.delete("/sessions/nope", headers=auth).status_code == 404
+
+
+def test_rotation_with_active_session_needs_force(client, auth):
+    client.post("/exits/vpn-1/sessions", headers=auth)
+    response = client.post("/exits/vpn-1/rotate", headers=auth)
+    assert response.status_code == 409
+    assert response.json()["active_sessions"] == 1
+
+    response = client.post("/exits/vpn-1/rotate?force=true", headers=auth)
+    assert response.status_code == 202
+    wait_for(client, auth, response.json()["operation_id"])
+
+
+def test_session_during_rotation_returns_operation(client, auth):
+    client.app.state.hub.running["vpn-1"] = "other-operation"
+    response = client.post("/exits/vpn-1/sessions", headers=auth)
+    assert response.status_code == 409
+    assert response.json()["operation_id"] == "other-operation"
+
+
+def test_session_in_other_country(client, auth):
+    response = client.post("/exits/vpn-1/sessions?country=Belgium", headers=auth)
+    assert response.status_code == 409
+    assert response.json()["country"] == "france"
+
+
+def test_session_on_down_exit(client, auth, fake):
+    fake.reachable = False
+    client.get("/exits/vpn-1/ip", headers=auth)
+    assert client.post("/exits/vpn-1/sessions", headers=auth).status_code == 503

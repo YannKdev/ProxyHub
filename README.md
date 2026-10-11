@@ -56,13 +56,45 @@ curl -H "$H" $API/exits                                   # état, IP, pays
 curl -H "$H" $API/exits/vpn-1/ip                          # IP mesurée maintenant
 curl -H "$H" -X POST $API/exits/vpn-1/rotate              # nouvelle IP, même pays
 curl -H "$H" -X POST "$API/exits/vpn-1/rotate?country=Belgium"
+curl -H "$H" -X POST "$API/exits/vpn-1/rotate?force=true" # même avec des sessions ouvertes
 curl -H "$H" $API/operations/<operation_id>               # résultat de la rotation
 curl -H "$H" $API/exits/vpn-1/history                     # 7 derniers jours
+
+curl -H "$H" -X POST $API/exits/vpn-1/sessions            # ouvre une session -> session_id
+curl -H "$H" -X POST "$API/exits/vpn-1/sessions?country=Belgium"
+curl -H "$H" -X DELETE $API/sessions/<session_id>         # ferme la session
 ```
 
 - rotate : 202 + `operation_id`, `changed: false` si l'IP n'a pas bougé après `max_attempts`
-- 409 : rotation déjà en cours, 429 : délai minimal (`Retry-After`)
-- sorties : `vps/config/exits.yaml`
+- 409 : opération en cours (`operation_id`), sessions ouvertes (`active_sessions`), autre pays (`country`)
+- 429 : délai minimal (`Retry-After`)
+- session : expire seule après `session_ttl_seconds`, pas de rotation tant qu'une session est ouverte
+- rotation auto : `rotate_every_sessions: N` dans `vps/config/exits.yaml`
+
+## Client Python
+
+```sh
+pip install "git+https://github.com/YannKdev/ProxyHub#subdirectory=client"
+```
+
+```python
+from proxyhub_client import ProxyHub
+
+hub = ProxyHub("http://<vps>:8090", token="...", proxy_user="...", proxy_password="...")
+
+with hub.session("vpn-1") as s:                    # requests.Session qui sort par vpn-1
+    s.get("https://example.org")
+
+with hub.session("vpn-1", country="Belgium") as s: # change de pays si besoin
+    s.get("https://example.org")
+
+hub.rotate("vpn-1")                                # attend le résultat
+hub.rotate("vpn-1", wait=False)                    # renvoie l'operation_id
+hub.exits()
+```
+
+- `hub.session` attend la fin d'une rotation en cours avant d'ouvrir la session
+- exemple complet : `client/examples/hub_example.py`
 
 ## Tests
 

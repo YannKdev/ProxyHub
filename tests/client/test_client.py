@@ -86,6 +86,22 @@ def test_session_waits_for_running_rotation(hub, fake):
         assert s.proxyhub["session_id"]
 
 
+def test_rotate_waits_for_cooldown(settings, new_exit, api_token):
+    app = create_app(settings, {"vpn-1": new_exit(FakeGluetun(["1.1.1.1"]), cooldown_seconds=1)})
+    server, thread, port = serve(app)
+    try:
+        hub = ProxyHub(f"http://127.0.0.1:{port}", api_token, "user", "password")
+        hub.wait(hub.rotate("vpn-1", wait=False), poll=0.05)
+        with pytest.raises(ProxyHubError) as error:
+            hub.rotate("vpn-1", wait=False)
+        assert error.value.status == 429
+        assert error.value.data["retry_after"] == 1
+        assert hub.rotate("vpn-1")["attempts"] == 3
+    finally:
+        server.should_exit = True
+        thread.join(5)
+
+
 def test_errors(hub, api_token):
     with pytest.raises(ProxyHubError) as error:
         hub.ip("nope")

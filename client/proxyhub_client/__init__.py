@@ -43,6 +43,8 @@ class ProxyHub:
                 data = response.json()
             except ValueError:
                 data = {"detail": response.text}
+            if "Retry-After" in response.headers:
+                data["retry_after"] = int(response.headers["Retry-After"])
             raise ProxyHubError(
                 f"{method} {path}: {response.status_code} {data.get('detail')}",
                 response.status_code,
@@ -73,16 +75,28 @@ class ProxyHub:
         wait: bool = True,
         timeout: float = 600,
     ) -> dict | str:
-        """Nouvelle IP. Renvoie le résultat de la rotation, ou son identifiant si wait=False."""
+        """Nouvelle IP. Renvoie le résultat de la rotation, ou son identifiant si wait=False.
+
+        Avec wait=True, un délai minimal en cours (429) est attendu puis la demande est refaite.
+        """
         params: dict[str, str] = {}
         if country:
             params["country"] = country
         if force:
             params["force"] = "true"
-        op = self._request("POST", f"/exits/{exit_id}/rotate", params=params)
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                op = self._request("POST", f"/exits/{exit_id}/rotate", params=params)
+                break
+            except ProxyHubError as e:
+                retry_after = e.data.get("retry_after")
+                if not wait or retry_after is None or time.monotonic() + retry_after > deadline:
+                    raise
+                time.sleep(retry_after)
         if not wait:
             return op["operation_id"]
-        return self.wait(op["operation_id"], timeout)
+        return self.wait(op["operation_id"], max(deadline - time.monotonic(), 1))
 
     def wait(self, operation_id: str, timeout: float = 600, poll: float = 2) -> dict:
         deadline = time.monotonic() + timeout

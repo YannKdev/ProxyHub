@@ -1,6 +1,8 @@
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
+import yaml
 from app.config import ConfigError, load_exits, load_settings
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -17,6 +19,12 @@ def test_settings_from_env():
     assert settings.monitor_seconds == 5
     assert settings.history_days == 3
     assert settings.ip_check_url == "https://api.ipify.org"
+    assert settings.compose_profiles == []
+
+
+def test_compose_profiles_from_env():
+    settings = load_settings(ENV | {"COMPOSE_PROFILES": "cyberghost-1, other,"})
+    assert settings.compose_profiles == ["cyberghost-1", "other"]
 
 
 @pytest.mark.parametrize("name", list(ENV))
@@ -31,8 +39,37 @@ def test_short_token_is_refused():
 
 
 def test_shipped_exits_file_is_valid():
-    exits = load_exits(ROOT / "vps" / "config" / "exits.yaml")
-    assert [e.id for e in exits] == ["vpn-1"]
+    path = ROOT / "vps" / "config" / "exits.yaml"
+    assert [e.id for e in load_exits(path)] == ["vpn-1"]
+    assert [e.id for e in load_exits(path, ["cyberghost-2"])] == ["vpn-1", "cyberghost-2"]
+    all_exits = load_exits(path, ["cyberghost-1", "cyberghost-2"])
+    assert [e.id for e in all_exits] == ["vpn-1", "cyberghost-1", "cyberghost-2"]
+    assert len({e.proxy_port for e in all_exits}) == 3
+
+
+def test_shipped_profiles_match_compose():
+    compose = yaml.safe_load((ROOT / "vps" / "docker-compose.yml").read_text(encoding="utf-8"))
+    compose_profiles = {p for s in compose["services"].values() for p in s.get("profiles", [])}
+    exits = load_exits(ROOT / "vps" / "config" / "exits.yaml", compose_profiles)
+    for exit in exits:
+        proxy = urlsplit(exit.proxy_url)
+        service = compose["services"][proxy.hostname]
+        assert urlsplit(exit.gluetun_control_url).hostname == proxy.hostname
+        assert f"{exit.proxy_port}:{proxy.port}" in service["ports"]
+        assert service.get("profiles", [None]) == [exit.profile]
+
+
+def test_exit_with_inactive_profile_is_skipped(tmp_path):
+    path = tmp_path / "exits.yaml"
+    path.write_text(
+        "exits:\n"
+        "  - {id: vpn-1, type: vpn, proxy_port: 8081, proxy_url: http://g:8888, "
+        "gluetun_control_url: http://g:8000}\n"
+        "  - {id: vpn-2, type: vpn, profile: extra, proxy_port: 8082, proxy_url: http://h:8888, "
+        "gluetun_control_url: http://h:8000}\n"
+    )
+    assert [e.id for e in load_exits(path, ["other"])] == ["vpn-1"]
+    assert [e.id for e in load_exits(path, ["other", "extra"])] == ["vpn-1", "vpn-2"]
 
 
 def test_duplicate_exit_ids_are_refused(tmp_path):

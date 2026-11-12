@@ -16,23 +16,35 @@ failed=0
 ok() { echo "OK   $1"; }
 fail() { echo "FAIL $1"; failed=1; }
 
+# Sorties à vérifier : id:port. Les sorties facultatives, si leur profil (= leur id) est actif.
+exits_to_check="vpn-1:8081"
+for entry in cyberghost-1:8082 cyberghost-2:8083; do
+  case ",${COMPOSE_PROFILES:-}," in
+    *",${entry%:*},"*) exits_to_check="$exits_to_check $entry" ;;
+  esac
+done
+
 direct_ip=$(curl -fsS --max-time 15 "$ip_service")
 echo "direct IP: $direct_ip"
 
-vpn_ip=$(curl -fsS --max-time 30 -x "http://$PROXY_USER:$PROXY_PASSWORD@$host:8081" "$ip_service" || true)
-if [ -n "$vpn_ip" ] && [ "$vpn_ip" != "$direct_ip" ]; then
-  ok "vpn-1 exit IP: $vpn_ip"
-else
-  fail "vpn-1 exit IP: '$vpn_ip'"
-fi
-
-for creds in "" "nobody:wrong@"; do
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -x "http://$creds$host:8081" "http://example.com" || true)
-  if [ "$code" = "407" ] || [ "$code" = "401" ]; then
-    ok "vpn-1 rejects bad credentials ($code)"
+for entry in $exits_to_check; do
+  id=${entry%:*}
+  port=${entry#*:}
+  exit_ip=$(curl -fsS --max-time 30 -x "http://$PROXY_USER:$PROXY_PASSWORD@$host:$port" "$ip_service" || true)
+  if [ -n "$exit_ip" ] && [ "$exit_ip" != "$direct_ip" ]; then
+    ok "$id exit IP: $exit_ip"
   else
-    fail "vpn-1 accepted bad credentials ($code)"
+    fail "$id exit IP: '$exit_ip'"
   fi
+
+  for creds in "" "nobody:wrong@"; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -x "http://$creds$host:$port" "http://example.com" || true)
+    if [ "$code" = "407" ] || [ "$code" = "401" ]; then
+      ok "$id rejects bad credentials ($code)"
+    else
+      fail "$id accepted bad credentials ($code)"
+    fi
+  done
 done
 
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$api/health" || true)
@@ -43,11 +55,11 @@ code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$api/exits" || true
 
 auth="Authorization: Bearer $API_TOKEN"
 exits=$(curl -fsS --max-time 30 -H "$auth" "$api/exits" || true)
-if echo "$exits" | grep -q '"id":"vpn-1"'; then
-  ok "api lists vpn-1: $(echo "$exits" | grep -oE '"state":"[a-z]+"' | head -1 || true)"
-else
-  fail "api exits: '$exits'"
-fi
+for entry in $exits_to_check; do
+  id=${entry%:*}
+  state=$(echo "$exits" | grep -oE "\"id\":\"$id\",\"type\":\"[a-z]+\",\"state\":\"[a-z]+\"" | cut -d'"' -f12 || true)
+  [ -n "$state" ] && ok "api lists $id: $state" || fail "api exits: '$exits'"
+done
 
 if [ -n "${API_DOMAIN:-}" ]; then
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://$API_DOMAIN/health" || true)

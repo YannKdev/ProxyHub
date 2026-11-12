@@ -270,14 +270,17 @@ class Hub:
             old_ip = self.status[exit_id].ip
         current = await driver.country()
         switch = country if country and not same_country(country, current) else None
+        # Deux sorties du même fournisseur peuvent tomber sur le même serveur, donc la même IP.
+        taken = {s.ip: other for other, s in self.status.items() if other != exit_id and s.ip}
+        avoid = set(taken) | {old_ip}
 
         new_ip = None
         attempts = 0
         while attempts < driver.config.max_attempts:
             attempts += 1
             await driver.reconnect(switch if attempts == 1 else None)
-            new_ip = await self._wait_for_ip(driver, old_ip)
-            if new_ip and new_ip != old_ip:
+            new_ip = await self._wait_for_ip(driver, avoid)
+            if new_ip and new_ip not in avoid:
                 break
         if new_ip is None:
             raise ExitError("exit did not come back after rotation")
@@ -288,6 +291,7 @@ class Hub:
             "old_ip": old_ip,
             "new_ip": new_ip,
             "changed": new_ip != old_ip,
+            "shared_with": [taken[new_ip]] if new_ip in taken else [],
             "attempts": attempts,
             "duration_seconds": round(time.monotonic() - started, 1),
         }
@@ -297,7 +301,7 @@ class Hub:
         driver = self.exits[exit_id]
         started = time.monotonic()
         await driver.reconnect()
-        new_ip = await self._wait_for_ip(driver, None)
+        new_ip = await self._wait_for_ip(driver, set())
         if new_ip is None:
             raise ExitError("exit did not come back after reconnecting")
         return {
@@ -307,8 +311,8 @@ class Hub:
             "duration_seconds": round(time.monotonic() - started, 1),
         }
 
-    async def _wait_for_ip(self, driver: VpnExit, old_ip: str | None) -> str | None:
-        """Mesure jusqu'à obtenir une IP différente de `old_ip`, ou jusqu'au délai."""
+    async def _wait_for_ip(self, driver: VpnExit, avoid: set[str | None]) -> str | None:
+        """Mesure jusqu'à obtenir une IP hors de `avoid`, ou jusqu'au délai."""
         deadline = time.monotonic() + driver.config.ready_timeout_seconds
         last_ip = None
         while True:
@@ -318,7 +322,7 @@ class Hub:
                 ip = None
             if ip:
                 last_ip = ip
-                if ip != old_ip:
+                if ip not in avoid:
                     return ip
             if time.monotonic() >= deadline:
                 return last_ip

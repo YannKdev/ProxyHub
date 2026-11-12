@@ -36,10 +36,12 @@ def create_app(
     try:
         settings = settings or load_settings()
         if exits is None:
-            exits = {c.id: make_vpn_exit(c, settings) for c in load_exits(settings.exits_file)}
+            configs = load_exits(settings.exits_file, settings.compose_profiles)
+            exits = {c.id: make_vpn_exit(c, settings) for c in configs}
     except ConfigError as e:
         log.error("%s", e)
         raise SystemExit(1) from None
+    log.info("exits loaded: %s", ", ".join(exits) or "none")
 
     hub = Hub(settings, exits, Store(settings.db_path))
 

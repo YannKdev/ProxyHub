@@ -1,5 +1,5 @@
 import os
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from pathlib import Path
 from typing import Literal
 
@@ -39,6 +39,7 @@ class Settings(BaseModel):
     auth_max_failures: int = Field(default=5, ge=1)
     auth_failure_window_seconds: float = Field(default=600, gt=0)
     auth_block_seconds: float = Field(default=1800, gt=0)
+    compose_profiles: list[str] = Field(default_factory=list)
 
 
 class VpnExitConfig(BaseModel):
@@ -46,6 +47,7 @@ class VpnExitConfig(BaseModel):
 
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]*$")
     type: Literal["vpn"]
+    profile: str | None = None
     proxy_port: int
     proxy_url: str
     gluetun_control_url: str
@@ -70,19 +72,21 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
     if len(env["API_TOKEN"]) < MIN_TOKEN_LENGTH:
         raise ConfigError(f"API_TOKEN must be at least {MIN_TOKEN_LENGTH} characters")
     optional = {field: env[name] for name, field in OPTIONAL_ENV.items() if env.get(name)}
+    profiles = [p.strip() for p in env.get("COMPOSE_PROFILES", "").split(",") if p.strip()]
     try:
         return Settings(
             api_token=env["API_TOKEN"],
             proxy_user=env["PROXY_USER"],
             proxy_password=env["PROXY_PASSWORD"],
             gluetun_api_key=env["GLUETUN_API_KEY"],
+            compose_profiles=profiles,
             **optional,
         )
     except ValidationError as e:
         raise ConfigError(f"invalid settings: {e}") from e
 
 
-def load_exits(path: Path) -> list[VpnExitConfig]:
+def load_exits(path: Path, profiles: Collection[str] = ()) -> list[VpnExitConfig]:
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
         exits = ExitsFile.model_validate(data).exits
@@ -91,4 +95,4 @@ def load_exits(path: Path) -> list[VpnExitConfig]:
     ids = [exit.id for exit in exits]
     if len(set(ids)) != len(ids):
         raise ConfigError(f"duplicate exit id in {path}")
-    return exits
+    return [exit for exit in exits if exit.profile is None or exit.profile in profiles]

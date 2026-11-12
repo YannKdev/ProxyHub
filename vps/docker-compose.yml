@@ -7,34 +7,83 @@ x-logging: &logging
     max-size: "10m"
     max-file: "3"
 
+# Commun à toutes les sorties VPN (une sortie = un conteneur Gluetun).
+x-gluetun: &gluetun
+  image: qmcgaw/gluetun:v3.41.3
+  restart: unless-stopped
+  logging: *logging
+  cap_add:
+    - NET_ADMIN
+  devices:
+    - /dev/net/tun:/dev/net/tun
+
+x-gluetun-env: &gluetun-env
+  # Liste des serveurs du fournisseur remise à jour chaque jour, gardée dans le volume.
+  UPDATER_PERIOD: 24h
+  HTTPPROXY: "on"
+  HTTPPROXY_USER: ${PROXY_USER:?set it in vps/.env}
+  HTTPPROXY_PASSWORD: ${PROXY_PASSWORD:?set it in vps/.env}
+  # Pas d'en-têtes de proxy ajoutés : l'IP du client n'est pas transmise au site.
+  HTTPPROXY_STEALTH: "on"
+  # Serveur de contrôle sur :8000, non publié, réservé au contrôleur.
+  HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE: '{"auth":"apikey","apikey":"${GLUETUN_API_KEY:?set it in vps/.env}"}'
+  TZ: ${TZ:-Europe/Paris}
+
+# Gluetun ne gère CyberGhost qu'en OpenVPN.
+x-cyberghost-env: &cyberghost-env
+  <<: *gluetun-env
+  VPN_SERVICE_PROVIDER: cyberghost
+  VPN_TYPE: openvpn
+
 services:
   gluetun:
-    image: qmcgaw/gluetun:v3.41.3
-    restart: unless-stopped
-    logging: *logging
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
+    <<: *gluetun
     ports:
       - "8081:8888"
     volumes:
       - gluetun-data:/gluetun
     environment:
+      <<: *gluetun-env
       VPN_SERVICE_PROVIDER: nordvpn
       VPN_TYPE: wireguard
       WIREGUARD_PRIVATE_KEY: ${WIREGUARD_PRIVATE_KEY:?set it in vps/.env}
       SERVER_COUNTRIES: ${SERVER_COUNTRIES:-}
-      # Liste des serveurs NordVPN remise à jour chaque jour, gardée dans le volume.
-      UPDATER_PERIOD: 24h
-      HTTPPROXY: "on"
-      HTTPPROXY_USER: ${PROXY_USER:?set it in vps/.env}
-      HTTPPROXY_PASSWORD: ${PROXY_PASSWORD:?set it in vps/.env}
-      # Pas d'en-têtes de proxy ajoutés : l'IP du client n'est pas transmise au site.
-      HTTPPROXY_STEALTH: "on"
-      # Serveur de contrôle sur :8000, non publié, réservé au contrôleur.
-      HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE: '{"auth":"apikey","apikey":"${GLUETUN_API_KEY:?set it in vps/.env}"}'
-      TZ: ${TZ:-Europe/Paris}
+
+  # Sorties facultatives : lancées seulement si COMPOSE_PROFILES contient leur profil.
+  # Pas de ${VAR:?} ici : Compose le vérifierait même profil inactif.
+  # Gluetun refuse de démarrer si un identifiant, le certificat ou la clé manque.
+  gluetun-cyberghost-1:
+    <<: *gluetun
+    profiles:
+      - cyberghost-1
+    ports:
+      - "8082:8888"
+    volumes:
+      - gluetun-cyberghost-1-data:/gluetun
+    environment:
+      <<: *cyberghost-env
+      OPENVPN_USER: ${CYBERGHOST_USER:-}
+      OPENVPN_PASSWORD: ${CYBERGHOST_PASSWORD:-}
+      OPENVPN_CERT: ${CYBERGHOST_CERT:-}
+      OPENVPN_KEY: ${CYBERGHOST_KEY:-}
+      SERVER_COUNTRIES: ${CYBERGHOST_COUNTRIES:-France}
+
+  # Mêmes identifiants que la première sortie, sauf si CYBERGHOST_2_* est défini.
+  gluetun-cyberghost-2:
+    <<: *gluetun
+    profiles:
+      - cyberghost-2
+    ports:
+      - "8083:8888"
+    volumes:
+      - gluetun-cyberghost-2-data:/gluetun
+    environment:
+      <<: *cyberghost-env
+      OPENVPN_USER: ${CYBERGHOST_2_USER:-${CYBERGHOST_USER:-}}
+      OPENVPN_PASSWORD: ${CYBERGHOST_2_PASSWORD:-${CYBERGHOST_PASSWORD:-}}
+      OPENVPN_CERT: ${CYBERGHOST_2_CERT:-${CYBERGHOST_CERT:-}}
+      OPENVPN_KEY: ${CYBERGHOST_2_KEY:-${CYBERGHOST_KEY:-}}
+      SERVER_COUNTRIES: ${CYBERGHOST_2_COUNTRIES:-${CYBERGHOST_COUNTRIES:-France}}
 
   controller:
     build: ./controller
@@ -50,6 +99,8 @@ services:
       PROXY_USER: ${PROXY_USER:?set it in vps/.env}
       PROXY_PASSWORD: ${PROXY_PASSWORD:?set it in vps/.env}
       GLUETUN_API_KEY: ${GLUETUN_API_KEY:?set it in vps/.env}
+      # Les sorties marquées d'un profil dans exits.yaml ne sont chargées que si ce profil est actif.
+      COMPOSE_PROFILES: ${COMPOSE_PROFILES:-}
       # IP du client lue dans X-Forwarded-For, posé par Caddy. Le contrôleur n'est pas joignable
       # d'Internet, donc personne d'autre ne peut fournir cet en-tête.
       FORWARDED_ALLOW_IPS: "*"
@@ -76,6 +127,8 @@ services:
 
 volumes:
   gluetun-data:
+  gluetun-cyberghost-1-data:
+  gluetun-cyberghost-2-data:
   controller-data:
   caddy-data:
   caddy-config:

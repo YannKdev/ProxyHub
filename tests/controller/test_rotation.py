@@ -1,7 +1,8 @@
 import asyncio
 
 import pytest
-from app.hub import CooldownActive, ExitBusy
+from app.hub import CooldownActive, ExitBusy, Hub
+from app.store import Store
 from fakes.fake_gluetun import FakeGluetun
 
 
@@ -133,3 +134,41 @@ def test_rotation_is_recorded_in_history(rotate):
 
     events = [entry["event"] for entry in hub.store.history("vpn-1", 10)]
     assert events == ["rotation"]
+
+
+@pytest.fixture
+def rotate_beside(settings, new_exit):
+    """Rotation de vpn-1 alors que vpn-2 sort déjà par `other_ip`."""
+
+    def run(fake, other_ip, **overrides):
+        async def scenario():
+            exits = {
+                "vpn-1": new_exit(fake, **overrides),
+                "vpn-2": new_exit(FakeGluetun([other_ip]), id="vpn-2", proxy_port=8082),
+            }
+            hub = Hub(settings, exits, Store(settings.db_path))
+            hub.startup()
+            hub.status["vpn-2"].ip = other_ip
+            op = hub.start_rotation("vpn-1")
+            await hub.wait_operations()
+            return hub.store.operation(op["id"])
+
+        return asyncio.run(scenario())
+
+    return run
+
+
+def test_rotation_skips_ip_of_another_exit(rotate_beside):
+    op = rotate_beside(FakeGluetun(["1.1.1.1", "2.2.2.2", "3.3.3.3"]), other_ip="2.2.2.2")
+
+    assert op["result"]["new_ip"] == "3.3.3.3"
+    assert op["result"]["attempts"] == 2
+    assert op["result"]["shared_with"] == []
+
+
+def test_rotation_reports_ip_shared_with_another_exit(rotate_beside):
+    op = rotate_beside(FakeGluetun(["1.1.1.1", "2.2.2.2"]), other_ip="2.2.2.2", max_attempts=2)
+
+    assert op["result"]["new_ip"] == "2.2.2.2"
+    assert op["result"]["changed"] is True
+    assert op["result"]["shared_with"] == ["vpn-2"]

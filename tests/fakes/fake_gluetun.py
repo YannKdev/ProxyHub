@@ -12,18 +12,28 @@ class FakeGluetun:
     Quand la liste est épuisée, l'IP ne change plus.
     """
 
-    def __init__(self, ips: list[str], country: str = "france", api_key: str = "gluetun-key"):
+    def __init__(
+        self,
+        ips: list[str],
+        country: str = "france",
+        api_key: str = "gluetun-key",
+        known: set[str] = KNOWN_COUNTRIES,
+    ):
+        # known : pays proposés par le fournisseur de cette sortie.
+        self.known = known
         self.api_key = api_key
         self.countries = [country]
         self.status = "running"
         self.reachable = True
         self.connects = True
+        # Pays dont les serveurs ne répondent pas (liste de serveurs périmée, par exemple).
+        self.broken_countries: set[str] = set()
         self.requests: list[tuple[str, str]] = []
         self._ips = list(ips)
         self.ip = self._ips.pop(0)
 
     def _reconnect(self) -> None:
-        if not self.connects:
+        if not self.connects or any(c.casefold() in self.broken_countries for c in self.countries):
             self.status = "stopped"
             return
         if self._ips:
@@ -44,7 +54,8 @@ class FakeGluetun:
             )
         if route == ("PUT", "/v1/vpn/settings"):
             countries = json.loads(request.content)["provider"]["server_selection"]["countries"]
-            if any(c.casefold() not in KNOWN_COUNTRIES for c in countries):
+            # Comme Gluetun : refus seulement si aucun nom n'est valide.
+            if not any(c.casefold() in self.known for c in countries):
                 return httpx.Response(400, text="invalid country")
             if countries == self.countries:
                 return httpx.Response(200, text="settings left unchanged")

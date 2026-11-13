@@ -57,7 +57,7 @@ auth="Authorization: Bearer $API_TOKEN"
 exits=$(curl -fsS --max-time 30 -H "$auth" "$api/exits" || true)
 for entry in $exits_to_check; do
   id=${entry%:*}
-  state=$(echo "$exits" | grep -oE "\"id\":\"$id\",\"type\":\"[a-z]+\",\"state\":\"[a-z]+\"" | cut -d'"' -f12 || true)
+  state=$(echo "$exits" | grep -oE "\"id\":\"$id\",[^}]*" | grep -oE '"state":"[a-z]+"' | cut -d'"' -f4 || true)
   [ -n "$state" ] && ok "api lists $id: $state" || fail "api exits: '$exits'"
 done
 
@@ -68,13 +68,51 @@ if [ -n "${API_DOMAIN:-}" ]; then
   [ "$code" = "308" ] && ok "http redirects to https" || fail "http returned $code, expected 308"
 fi
 
-session=$(curl -fsS --max-time 30 -X POST -H "$auth" "$api/exits/vpn-1/sessions" || true)
-session_id=$(echo "$session" | grep -oE '"session_id":"[a-f0-9]+"' | cut -d'"' -f4 || true)
-if [ -n "$session_id" ]; then
-  code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "$auth" "$api/sessions/$session_id")
-  [ "$code" = "204" ] && ok "api session open and close" || fail "api session close returned $code"
+# Proxy d'entrée (port 8080). Avec les deux sorties CyberGhost, les sessions de test restent
+# sur CyberGhost : vpn-1 sert encore directement sur 8081 pendant la migration.
+entry="$host:8080"
+pool=""
+case ",${COMPOSE_PROFILES:-}," in
+  *,cyberghost-1,*cyberghost-2,* | *,cyberghost-2,*cyberghost-1,*) pool="-pool-cyberghost" ;;
+esac
+s1="smoke1_$$"
+s2="smoke2_$$"
+through() { curl -fsS --max-time 60 -x "http://$PROXY_USER$pool-session-$1:$PROXY_PASSWORD@$entry" "$ip_service" || true; }
+status_through() { curl -s -o /dev/null -w '%{http_code}' --max-time 30 -x "http://$1@$entry" "http://example.com" || true; }
+
+ip1=$(through "$s1")
+ip1_again=$(through "$s1")
+if [ -n "$ip1" ] && [ "$ip1" = "$ip1_again" ] && [ "$ip1" != "$direct_ip" ]; then
+  ok "entry proxy keeps the IP of a session ($ip1)"
 else
-  fail "api session open: '$session'"
+  fail "entry proxy session IPs: '$ip1' then '$ip1_again'"
 fi
+if [ -n "$pool" ]; then
+  ip2=$(through "$s2")
+  if [ -n "$ip2" ] && [ "$ip2" != "$ip1" ]; then
+    ok "entry proxy gives another IP to another session ($ip2)"
+  else
+    fail "entry proxy second session IP: '$ip2'"
+  fi
+else
+  code=$(status_through "$PROXY_USER-session-$s2:$PROXY_PASSWORD")
+  [ "$code" = "503" ] && ok "entry proxy refuses a session without free exit (503)" \
+    || fail "entry proxy second session returned $code, expected 503"
+fi
+
+# Un seul essai faux : chaque mauvais mot de passe compte pour le blocage de l'IP (5 en 10 min).
+for creds in "" "$PROXY_USER:wrong@"; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -x "http://$creds$entry" "http://example.com" || true)
+  [ "$code" = "407" ] && ok "entry proxy rejects bad credentials (407)" || fail "entry proxy bad credentials returned $code"
+done
+code=$(status_through "$PROXY_USER-colour-red:$PROXY_PASSWORD")
+[ "$code" = "400" ] && ok "entry proxy rejects unknown options (400)" || fail "entry proxy unknown option returned $code"
+
+# Libère les sessions de test (leurs sorties tournent ensuite en tâche de fond).
+sessions=$(curl -fsS --max-time 15 -H "$auth" "$api/sessions" || true)
+for name in "$s1" "$s2"; do
+  id=$(echo "$sessions" | grep -oE "\"id\":\"[a-f0-9]+\",\"label\":\"$name\"" | cut -d'"' -f4 || true)
+  [ -n "$id" ] && curl -s -o /dev/null -X DELETE -H "$auth" "$api/sessions/$id"
+done
 
 exit $failed

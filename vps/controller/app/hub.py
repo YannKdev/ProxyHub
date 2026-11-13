@@ -2,20 +2,23 @@ import asyncio
 import logging
 import math
 import time
+import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from functools import partial
 from typing import Any
 
 from .config import Settings
+from .countries import country_names, in_country
 from .store import Store, utcnow
-from .vpn import ExitError, VpnExit
+from .vpn import CountryRejected, ExitError, VpnExit
 
 log = logging.getLogger("proxyhub")
 
 # État affiché pendant une opération.
 BUSY_STATE = {"rotate": "rotating", "recover": "recovering"}
+DEFAULT_POOL = "vpn"
 
 
 class UnknownExit(Exception):
@@ -28,26 +31,28 @@ class ExitBusy(Exception):
         self.operation_id = operation_id
 
 
-class ExitInUse(Exception):
-    def __init__(self, active_sessions: int):
-        super().__init__(f"{active_sessions} active sessions")
-        self.active_sessions = active_sessions
-
-
-class ExitDown(Exception):
-    pass
-
-
-class CountryMismatch(Exception):
-    def __init__(self, current: str):
-        super().__init__(current)
-        self.current = current
+class ExitReserved(Exception):
+    def __init__(self, session_id: str):
+        super().__init__(f"exit reserved by session {session_id}")
+        self.session_id = session_id
 
 
 class CooldownActive(Exception):
     def __init__(self, retry_after: int):
         super().__init__(f"retry in {retry_after} s")
         self.retry_after = retry_after
+
+
+class NoFreeExit(Exception):
+    pass
+
+
+class SessionFailed(Exception):
+    pass
+
+
+class _ExitUnavailable(Exception):
+    pass
 
 
 @dataclass
@@ -61,8 +66,49 @@ class ExitStatus:
     last_recovery: float | None = None
 
 
-def same_country(a: str | None, b: str | None) -> bool:
-    return (a or "").casefold() == (b or "").casefold()
+@dataclass
+class Session:
+    """Réservation exclusive d'une sortie par un client du proxy d'entrée."""
+
+    id: str
+    key: tuple[str, str, str | None]
+    label: str
+    pool: str
+    country: str | None
+    idle_seconds: float
+    created_at: str
+    exit_id: str | None = None
+    last_seen: float = field(default_factory=time.monotonic)
+    connections: int = 0
+    tasks: set[asyncio.Task] = field(default_factory=set)
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    failure: Exception | None = None
+
+    def enter(self) -> None:
+        self.connections += 1
+        task = asyncio.current_task()
+        if task:
+            self.tasks.add(task)
+        self.last_seen = time.monotonic()
+
+    def leave(self) -> None:
+        self.connections -= 1
+        self.tasks.discard(asyncio.current_task())
+        self.last_seen = time.monotonic()
+
+    def describe(self) -> dict[str, Any]:
+        idle = 0 if self.connections else round(time.monotonic() - self.last_seen)
+        return {
+            "id": self.id,
+            "label": self.label,
+            "exit": self.exit_id,
+            "pool": self.pool,
+            "country": self.country,
+            "connections": self.connections,
+            "idle_seconds": idle,
+            "release_after_seconds": round(self.idle_seconds),
+            "created_at": self.created_at,
+        }
 
 
 class Hub:
@@ -73,7 +119,14 @@ class Hub:
         self.status = {exit_id: ExitStatus() for exit_id in exits}
         self.running: dict[str, str] = {}
         self.busy_state: dict[str, str] = {}
+        self.sessions: dict[tuple[str, str, str | None], Session] = {}
+        self.reserved: dict[str, Session] = {}
+        # Sorties libérées par une session, à faire tourner avant de les resservir.
+        self.stale: set[str] = set()
+        self.released_at: dict[str, float] = {}
         self._tasks: set[asyncio.Task] = set()
+        self._op_tasks: dict[str, asyncio.Task] = {}
+        self._op_errors: dict[str, Exception] = {}
 
     def startup(self) -> None:
         count = self.store.fail_unfinished_operations()
@@ -98,80 +151,180 @@ class Hub:
     def describe(self, exit_id: str) -> dict[str, Any]:
         config = self.driver(exit_id).config
         status = self.status[exit_id]
+        session = self.reserved.get(exit_id)
         return {
             "id": exit_id,
             "type": config.type,
+            "pool": config.pool,
             "state": self.busy_state.get(exit_id, status.state),
             "ip": status.ip,
             "country": status.country,
             "proxy_port": config.proxy_port,
+            "session_id": session.id if session else None,
             "last_rotation_at": self.store.exit_row(exit_id)["last_rotation_at"],
             "checked_at": status.checked_at,
             "operation_id": self.running.get(exit_id),
-            "active_sessions": self.store.active_sessions(exit_id),
-            "sessions_since_rotation": self._sessions_since_rotation(exit_id),
-            "rotate_every_sessions": config.rotate_every_sessions,
         }
 
     def describe_all(self) -> list[dict[str, Any]]:
         return [self.describe(exit_id) for exit_id in self.exits]
 
-    # Sessions
+    # Sessions du proxy d'entrée
 
-    async def open_session(self, exit_id: str, country: str | None = None) -> dict[str, Any]:
-        config = self.driver(exit_id).config
-        if exit_id in self.running:
-            raise ExitBusy(self.running[exit_id])
-        status = self.status[exit_id]
-        if status.checked_at is None:
-            await self._check(exit_id)
-        if status.state == "down":
-            raise ExitDown(exit_id)
-        if country and status.country and not same_country(country, status.country):
-            raise CountryMismatch(status.country)
+    def describe_sessions(self) -> list[dict[str, Any]]:
+        return [session.describe() for session in self.sessions.values()]
 
-        session = self.store.open_session(exit_id, config.session_ttl_seconds)
-        log.info("session opened exit=%s session=%s", exit_id, session["id"])
-        return {
-            "session_id": session["id"],
-            "exit": exit_id,
-            "proxy_port": config.proxy_port,
-            "ip": status.ip,
-            "country": status.country,
-            "expires_at": session["expires_at"],
-        }
-
-    def close_session(self, session_id: str) -> dict[str, Any] | None:
-        session = self.store.close_session(session_id)
-        if session:
-            log.info("session closed exit=%s session=%s", session["exit"], session_id)
-            self._maybe_auto_rotate(session["exit"])
+    async def session_for(
+        self, name: str, pool: str, country: str | None, hold_minutes: int | None
+    ) -> Session:
+        """Session existante pour cette clé, ou nouvelle réservation d'une sortie libre."""
+        key = (name, pool, country)
+        idle = self.settings.session_idle_seconds
+        if hold_minutes:
+            idle = max(idle, min(hold_minutes, self.settings.max_hold_minutes) * 60)
+        session = self.sessions.get(key)
+        if session is None:
+            session = Session(
+                id=uuid.uuid4().hex[:12],
+                key=key,
+                label=name,
+                pool=pool,
+                country=country,
+                idle_seconds=idle,
+                created_at=utcnow().isoformat(),
+            )
+            self.sessions[key] = session
+            try:
+                await self._assign(session)
+            except BaseException as e:
+                session.failure = e if isinstance(e, Exception) else SessionFailed("interrupted")
+                del self.sessions[key]
+                raise
+            finally:
+                session.ready.set()
+            log.info(
+                "session opened session=%s exit=%s pool=%s country=%s",
+                session.id,
+                session.exit_id,
+                pool,
+                country,
+            )
+        else:
+            await session.ready.wait()
+            if isinstance(session.failure, NoFreeExit):
+                raise NoFreeExit(str(session.failure))
+            if session.failure:
+                raise SessionFailed(str(session.failure))
+            session.idle_seconds = idle
+        session.last_seen = time.monotonic()
         return session
 
-    def _sessions_since_rotation(self, exit_id: str) -> int:
-        last = self.store.exit_row(exit_id)["last_rotation_at"]
-        return self.store.closed_sessions_since(exit_id, last)
+    def release(self, session: Session, reason: str) -> None:
+        if self.sessions.get(session.key) is not session:
+            return
+        del self.sessions[session.key]
+        exit_id = session.exit_id
+        self._unreserve(session)
+        if exit_id:
+            self.stale.add(exit_id)
+            self.released_at[exit_id] = time.monotonic()
+        for task in list(session.tasks):
+            task.cancel()
+        log.info("session released session=%s exit=%s reason=%s", session.id, exit_id, reason)
 
-    def _maybe_auto_rotate(self, exit_id: str) -> None:
-        every = self.exits[exit_id].config.rotate_every_sessions
-        if not every or exit_id in self.running:
-            return
-        if self.store.active_sessions(exit_id):
-            return
-        if self._sessions_since_rotation(exit_id) < every:
-            return
-        # Délai minimal pas encore écoulé : le prochain balayage réessaiera.
-        if self._cooldown_left(exit_id) > 0:
-            return
-        self._launch(exit_id, "rotate", {"country": None, "trigger": "auto"})
+    def release_by_id(self, session_id: str) -> bool:
+        for session in list(self.sessions.values()):
+            if session.id == session_id:
+                self.release(session, "api")
+                return True
+        return False
 
-    # Balayage : expiration des sessions, rotation automatique, reconnexion
+    def _unreserve(self, session: Session) -> None:
+        if session.exit_id and self.reserved.get(session.exit_id) is session:
+            del self.reserved[session.exit_id]
+        session.exit_id = None
+
+    def _candidates(self, pool: str, names: list[str] | None) -> list[str]:
+        """Sorties libres du groupe, celles utilisables tout de suite d'abord."""
+
+        def cost(exit_id: str) -> tuple[bool, bool, float]:
+            fresh = exit_id not in self.stale
+            country_ok = names is None or in_country(self.status[exit_id].country, names)
+            return (
+                exit_id in self.running,
+                not (fresh and country_ok),
+                self.released_at.get(exit_id, 0),
+            )
+
+        free = [
+            exit_id
+            for exit_id, driver in self.exits.items()
+            if pool in (driver.config.pool, driver.config.type)
+            and exit_id not in self.reserved
+            and self.status[exit_id].state != "down"
+        ]
+        return sorted(free, key=cost)
+
+    async def _assign(self, session: Session) -> None:
+        names = country_names(session.country) if session.country else None
+        refused: Exception | None = None
+        for exit_id in self._candidates(session.pool, names):
+            if exit_id in self.reserved:
+                continue
+            self.reserved[exit_id] = session
+            session.exit_id = exit_id
+            try:
+                await self._prepare(exit_id, names)
+                return
+            except (CountryRejected, _ExitUnavailable) as e:
+                # Pays inconnu de ce fournisseur, ou sortie tombée entre-temps : la suivante.
+                refused = e
+                self._unreserve(session)
+            except BaseException:
+                self._unreserve(session)
+                raise
+        if isinstance(refused, CountryRejected):
+            raise SessionFailed(f"country {session.country} not available in pool {session.pool}")
+        raise NoFreeExit(f"no free exit in pool {session.pool}")
+
+    async def _prepare(self, exit_id: str, names: list[str] | None) -> None:
+        """Rend une sortie réservée utilisable : IP neuve après libération, bon pays."""
+        while exit_id in self.running:
+            await self._wait_operation(self.running[exit_id])
+        if self.status[exit_id].state == "down":
+            raise _ExitUnavailable(exit_id)
+        switch = names is not None and not in_country(self.status[exit_id].country, names)
+        if not switch and exit_id not in self.stale:
+            return
+        op = self._launch(
+            exit_id, "rotate", {"country": names if switch else None, "trigger": "proxy"}
+        )
+        final = await self._wait_operation(op["id"])
+        error = self._op_errors.pop(op["id"], None)
+        if final["status"] == "failed":
+            if isinstance(error, CountryRejected):
+                raise error
+            raise SessionFailed(final["error"])
+
+    async def _wait_operation(self, op_id: str) -> dict[str, Any]:
+        task = self._op_tasks.get(op_id)
+        if task:
+            # shield : un client qui abandonne n'interrompt pas l'opération.
+            await asyncio.shield(task)
+        else:
+            await asyncio.sleep(0.05)
+        return self.store.operation(op_id)
+
+    # Balayage : sessions inactives, rotation des sorties libérées, reconnexion
 
     def sweep(self) -> None:
-        for exit_id in self.store.expire_sessions():
-            log.info("session expired exit=%s", exit_id)
+        now = time.monotonic()
+        for session in list(self.sessions.values()):
+            idle = now - session.last_seen
+            if session.ready.is_set() and not session.connections and idle > session.idle_seconds:
+                self.release(session, "idle")
         for exit_id in self.exits:
-            self._maybe_auto_rotate(exit_id)
+            self._maybe_refresh(exit_id)
             self._maybe_recover(exit_id)
 
     async def sweeper(self) -> None:
@@ -181,6 +334,13 @@ class Hub:
             except Exception:
                 log.exception("sweep failed")
             await asyncio.sleep(self.settings.sweep_seconds)
+
+    def _maybe_refresh(self, exit_id: str) -> None:
+        if exit_id not in self.stale or exit_id in self.reserved or exit_id in self.running:
+            return
+        if self.status[exit_id].state == "down" or self._cooldown_left(exit_id) > 0:
+            return
+        self._launch(exit_id, "rotate", {"country": None, "trigger": "release"})
 
     def _maybe_recover(self, exit_id: str) -> None:
         config = self.exits[exit_id].config
@@ -212,13 +372,14 @@ class Hub:
         self.driver(exit_id)
         if exit_id in self.running:
             raise ExitBusy(self.running[exit_id])
-        active = self.store.active_sessions(exit_id)
-        if active and not force:
-            raise ExitInUse(active)
+        session = self.reserved.get(exit_id)
+        if session and not force:
+            raise ExitReserved(session.id)
         wait = self._cooldown_left(exit_id)
         if wait > 0:
             raise CooldownActive(math.ceil(wait))
-        return self._launch(exit_id, "rotate", {"country": country, "trigger": "api"})
+        names = country_names(country) if country else None
+        return self._launch(exit_id, "rotate", {"country": names, "trigger": "api"})
 
     def _launch(self, exit_id: str, op_type: str, params: dict) -> dict[str, Any]:
         op = self.store.create_operation(op_type, exit_id, params)
@@ -231,7 +392,9 @@ class Hub:
             work = partial(self._recover, exit_id)
         task = asyncio.create_task(self._run(exit_id, op, work))
         self._tasks.add(task)
+        self._op_tasks[op["id"]] = task
         task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(lambda _, op_id=op["id"]: self._op_tasks.pop(op_id, None))
         return op
 
     async def wait_operations(self) -> None:
@@ -249,6 +412,8 @@ class Hub:
             log.warning("%s failed exit=%s error=%s", op["type"], exit_id, error)
             self.store.finish_operation(op["id"], "failed", error=error)
             self.store.add_history(exit_id, event, {"error": error})
+            if op["params"].get("trigger") == "proxy":
+                self._op_errors[op["id"]] = e
         else:
             log.info("%s done exit=%s result=%s", op["type"], exit_id, result)
             self.store.finish_operation(op["id"], "done", result=result)
@@ -257,11 +422,12 @@ class Hub:
             self.store.save_ip(exit_id, result["new_ip"])
         if op["type"] == "rotate":
             self.store.save_rotation_time(exit_id, utcnow())
+            self.stale.discard(exit_id)
         del self.running[exit_id]
         del self.busy_state[exit_id]
         await self._check(exit_id)
 
-    async def _rotate(self, exit_id: str, country: str | None) -> dict[str, Any]:
+    async def _rotate(self, exit_id: str, countries: list[str] | None) -> dict[str, Any]:
         driver = self.exits[exit_id]
         started = time.monotonic()
         try:
@@ -269,7 +435,7 @@ class Hub:
         except Exception:
             old_ip = self.status[exit_id].ip
         current = await driver.country()
-        switch = country if country and not same_country(country, current) else None
+        switch = countries if countries and not in_country(current, countries) else None
         # Deux sorties du même fournisseur peuvent tomber sur le même serveur, donc la même IP.
         taken = {s.ip: other for other, s in self.status.items() if other != exit_id and s.ip}
         avoid = set(taken) | {old_ip}
@@ -282,12 +448,18 @@ class Hub:
             new_ip = await self._wait_for_ip(driver, avoid)
             if new_ip and new_ip not in avoid:
                 break
+        if new_ip is None and switch and current:
+            # Pays injoignable : revenir au pays d'avant plutôt que laisser la sortie coupée.
+            await driver.reconnect([current])
+            back = await self._wait_for_ip(driver, set())
+            error = f"exit did not come back in {switch[0]}, switched back to {current}"
+            raise ExitError(error if back else f"{error}, still down")
         if new_ip is None:
             raise ExitError("exit did not come back after rotation")
 
         return {
             "exit": exit_id,
-            "country": country or current,
+            "country": switch[0] if switch else current,
             "old_ip": old_ip,
             "new_ip": new_ip,
             "changed": new_ip != old_ip,

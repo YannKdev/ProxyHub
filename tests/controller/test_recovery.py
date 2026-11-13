@@ -97,13 +97,13 @@ def test_no_recovery_when_disabled(new_hub):
     assert run(scenario()) is False
 
 
-def test_recovery_ignores_active_sessions(new_hub):
+def test_recovery_ignores_sessions(new_hub):
     fake = FakeGluetun(["1.1.1.1", "2.2.2.2"])
 
     async def scenario():
         hub = new_hub(fake)
         await hub.check_all()
-        await hub.open_session("vpn-1")
+        await hub.session_for("a", "vpn", None, None)
         fake.status = "stopped"
         await hub.check_all()
         hub.status["vpn-1"].down_since = time.monotonic() - 1000

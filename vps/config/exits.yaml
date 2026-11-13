@@ -1,22 +1,22 @@
 # Une sortie = une entrée ici + un service dans docker-compose.yml.
-# proxy_port : port publié pour les clients. proxy_url : adresse interne, pour mesurer l'IP.
-# rotate_every_sessions : rotation automatique après N sessions fermées (absent = jamais).
-# session_ttl_seconds : durée de vie d'une session non fermée (900 par défaut).
+# pool : groupe choisi par le client avec -pool- dans son nom d'utilisateur (ex. user-pool-nordvpn).
+# proxy_port : port publié de la sortie seule. proxy_url : son proxy interne, vers lequel relaie
+# le proxy d'entrée (port 8080) et à travers lequel l'IP est mesurée.
 # recover_after_seconds : reconnexion automatique après N s en "down" (120 par défaut, null = jamais).
 # recover_interval_seconds : délai minimal entre deux reconnexions automatiques (300 par défaut).
 # profile : sortie chargée seulement si ce profil Compose est dans COMPOSE_PROFILES (.env).
 exits:
   - id: vpn-1
     type: vpn
+    pool: nordvpn
     proxy_port: 8081
     proxy_url: http://gluetun:8888
     gluetun_control_url: http://gluetun:8000
     cooldown_seconds: 30
     max_attempts: 3
-    # rotate_every_sessions: 5
-    # session_ttl_seconds: 900
   - id: cyberghost-1
     type: vpn
+    pool: cyberghost
     profile: cyberghost-1
     proxy_port: 8082
     proxy_url: http://gluetun-cyberghost-1:8888
@@ -25,6 +25,7 @@ exits:
     max_attempts: 3
   - id: cyberghost-2
     type: vpn
+    pool: cyberghost
     profile: cyberghost-2
     proxy_port: 8083
     proxy_url: http://gluetun-cyberghost-2:8888

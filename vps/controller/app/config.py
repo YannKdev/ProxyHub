@@ -18,6 +18,10 @@ OPTIONAL_ENV = {
     "AUTH_MAX_FAILURES": "auth_max_failures",
     "AUTH_FAILURE_WINDOW_SECONDS": "auth_failure_window_seconds",
     "AUTH_BLOCK_SECONDS": "auth_block_seconds",
+    "PROXY_PORT": "proxy_port",
+    "SESSION_IDLE_SECONDS": "session_idle_seconds",
+    "MAX_HOLD_MINUTES": "max_hold_minutes",
+    "PROXY_WAIT_SECONDS": "proxy_wait_seconds",
 }
 
 
@@ -40,6 +44,13 @@ class Settings(BaseModel):
     auth_failure_window_seconds: float = Field(default=600, gt=0)
     auth_block_seconds: float = Field(default=1800, gt=0)
     compose_profiles: list[str] = Field(default_factory=list)
+    # Proxy d'entrée. None : pas de proxy (tests de l'API seule).
+    proxy_port: int | None = 8080
+    proxy_connect_ports: list[int] = Field(default_factory=lambda: [80, 443])
+    session_idle_seconds: float = Field(default=300, gt=0)
+    max_hold_minutes: int = Field(default=1440, ge=1)
+    # Attente maximale d'un client pendant qu'on prépare sa sortie (rotation, changement de pays).
+    proxy_wait_seconds: float = Field(default=150, gt=0)
 
 
 class VpnExitConfig(BaseModel):
@@ -47,6 +58,8 @@ class VpnExitConfig(BaseModel):
 
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]*$")
     type: Literal["vpn"]
+    # Groupe choisi par -pool- dans le nom d'utilisateur du proxy (fournisseur).
+    pool: str = Field(pattern=r"^[a-z0-9]+$")
     profile: str | None = None
     proxy_port: int
     proxy_url: str
@@ -55,14 +68,16 @@ class VpnExitConfig(BaseModel):
     max_attempts: int = Field(default=3, ge=1)
     ready_timeout_seconds: float = 90
     poll_seconds: float = 3
-    rotate_every_sessions: int | None = Field(default=None, ge=1)
-    session_ttl_seconds: float = Field(default=900, gt=0)
     recover_after_seconds: float | None = Field(default=120, gt=0)
     recover_interval_seconds: float = Field(default=300, gt=0)
 
 
 class ExitsFile(BaseModel):
     exits: list[VpnExitConfig]
+
+
+def split_list(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
@@ -72,7 +87,10 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
     if len(env["API_TOKEN"]) < MIN_TOKEN_LENGTH:
         raise ConfigError(f"API_TOKEN must be at least {MIN_TOKEN_LENGTH} characters")
     optional = {field: env[name] for name, field in OPTIONAL_ENV.items() if env.get(name)}
-    profiles = [p.strip() for p in env.get("COMPOSE_PROFILES", "").split(",") if p.strip()]
+    profiles = split_list(env.get("COMPOSE_PROFILES", ""))
+    ports = split_list(env.get("PROXY_CONNECT_PORTS", ""))
+    if ports:
+        optional["proxy_connect_ports"] = ports
     try:
         return Settings(
             api_token=env["API_TOKEN"],

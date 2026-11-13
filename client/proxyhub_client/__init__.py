@@ -1,7 +1,5 @@
-import logging
+import re
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
 from typing import Any
 from urllib.parse import quote, urlparse
 
@@ -9,7 +7,7 @@ import requests
 
 __all__ = ["ProxyHub", "ProxyHubError"]
 
-log = logging.getLogger("proxyhub_client")
+SESSION_PATTERN = re.compile(r"[A-Za-z0-9_]{1,64}")
 
 
 class ProxyHubError(Exception):
@@ -20,21 +18,74 @@ class ProxyHubError(Exception):
 
 
 class ProxyHub:
+    """Proxy d'entrée (`proxy_url`, `proxy`) et API d'administration (avec `token`)."""
+
     def __init__(
         self,
         base_url: str,
-        token: str,
-        proxy_user: str,
-        proxy_password: str,
+        token: str | None = None,
+        proxy_user: str | None = None,
+        proxy_password: str | None = None,
+        proxy_port: int = 8080,
         timeout: float = 30,
     ):
         self.base_url = base_url.rstrip("/")
         self.host = urlparse(self.base_url).hostname
+        self.proxy_user = proxy_user
+        self.proxy_password = proxy_password
+        self.proxy_port = proxy_port
         self.timeout = timeout
-        self._credentials = f"{quote(proxy_user, safe='')}:{quote(proxy_password, safe='')}"
         self._api = requests.Session()
         self._api.trust_env = False
-        self._api.headers["Authorization"] = f"Bearer {token}"
+        if token:
+            self._api.headers["Authorization"] = f"Bearer {token}"
+
+    # Proxy d'entrée
+
+    def proxy_url(
+        self,
+        session: str | int | None = None,
+        pool: str | None = None,
+        country: str | None = None,
+        hold: int | None = None,
+    ) -> str:
+        """URL du proxy d'entrée. Même `session` = même sortie, donc même IP ; nouvelle
+        `session` = autre IP. Sans `session`, le VPS garde une session par IP de client.
+
+        pool : nordvpn, cyberghost, mobile ou vpn (défaut). country : code à deux lettres.
+        hold : minutes pendant lesquelles la sortie reste réservée sans trafic.
+        """
+        if not self.proxy_user or not self.proxy_password:
+            raise ValueError("proxy_user and proxy_password are needed to use the proxy")
+        options: list[str] = []
+        if pool:
+            options += ["pool", pool]
+        if country:
+            options += ["country", country.lower()]
+        if session is not None:
+            if not SESSION_PATTERN.fullmatch(str(session)):
+                raise ValueError("session must be 1 to 64 letters, digits or underscores")
+            options += ["session", str(session)]
+        if hold:
+            options += ["hold", str(int(hold))]
+        user = quote("-".join([self.proxy_user, *options]), safe="")
+        return f"http://{user}:{quote(self.proxy_password, safe='')}@{self.host}:{self.proxy_port}"
+
+    def proxy(
+        self,
+        session: str | int | None = None,
+        pool: str | None = None,
+        country: str | None = None,
+        hold: int | None = None,
+    ) -> requests.Session:
+        """requests.Session qui passe par le proxy d'entrée (voir `proxy_url`)."""
+        url = self.proxy_url(session, pool, country, hold)
+        http = requests.Session()
+        http.trust_env = False
+        http.proxies = {"http": url, "https": url}
+        return http
+
+    # Administration (API)
 
     def _request(self, method: str, path: str, **kwargs) -> Any:
         response = self._api.request(method, self.base_url + path, timeout=self.timeout, **kwargs)
@@ -61,11 +112,14 @@ class ProxyHub:
     def history(self, exit_id: str, limit: int = 100) -> list[dict]:
         return self._request("GET", f"/exits/{exit_id}/history", params={"limit": limit})
 
+    def sessions(self) -> list[dict]:
+        return self._request("GET", "/sessions")
+
+    def release(self, session_id: str) -> None:
+        self._request("DELETE", f"/sessions/{session_id}")
+
     def operation(self, operation_id: str) -> dict:
         return self._request("GET", f"/operations/{operation_id}")
-
-    def proxy_url(self, port: int) -> str:
-        return f"http://{self._credentials}@{self.host}:{port}"
 
     def rotate(
         self,
@@ -75,7 +129,7 @@ class ProxyHub:
         wait: bool = True,
         timeout: float = 600,
     ) -> dict | str:
-        """Nouvelle IP. Renvoie le résultat de la rotation, ou son identifiant si wait=False.
+        """Nouvelle IP pour une sortie. Renvoie le résultat, ou l'identifiant si wait=False.
 
         Avec wait=True, un délai minimal en cours (429) est attendu puis la demande est refaite.
         """
@@ -109,45 +163,3 @@ class ProxyHub:
             if time.monotonic() > deadline:
                 raise ProxyHubError(f"operation {operation_id} still running after {timeout} s")
             time.sleep(poll)
-
-    @contextmanager
-    def session(self, exit_id: str, country: str | None = None) -> Iterator[requests.Session]:
-        """requests.Session qui sort par `exit_id`. Infos de la session dans `.proxyhub`."""
-        info = self._open_session(exit_id, country)
-        proxy = self.proxy_url(info["proxy_port"])
-        http = requests.Session()
-        http.trust_env = False
-        http.proxies = {"http": proxy, "https": proxy}
-        http.proxyhub = info
-        try:
-            yield http
-        finally:
-            http.close()
-            try:
-                self._request("DELETE", f"/sessions/{info['session_id']}")
-            except (ProxyHubError, requests.RequestException) as e:
-                log.warning("could not close session %s: %s", info["session_id"], e)
-
-    def _open_session(self, exit_id: str, country: str | None, timeout: float = 600) -> dict:
-        params = {"country": country} if country else {}
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                return self._request("POST", f"/exits/{exit_id}/sessions", params=params)
-            except ProxyHubError as e:
-                if e.status != 409 or time.monotonic() > deadline:
-                    raise
-                if e.data.get("operation_id"):
-                    # Rotation en cours : on attend sa fin.
-                    self._wait_quietly(e.data["operation_id"], timeout)
-                elif e.data.get("country"):
-                    # Sortie dans un autre pays : on la fait changer de pays.
-                    self.rotate(exit_id, country=country, timeout=timeout)
-                else:
-                    raise
-
-    def _wait_quietly(self, operation_id: str, timeout: float) -> None:
-        try:
-            self.wait(operation_id, timeout)
-        except ProxyHubError as e:
-            log.warning("%s", e)

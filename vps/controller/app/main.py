@@ -10,15 +10,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .config import ConfigError, Settings, load_exits, load_settings
 from .guard import Guard
-from .hub import (
-    CooldownActive,
-    CountryMismatch,
-    ExitBusy,
-    ExitDown,
-    ExitInUse,
-    Hub,
-    UnknownExit,
-)
+from .hub import CooldownActive, ExitBusy, ExitReserved, Hub, UnknownExit
+from .proxy import EntryProxy
 from .store import Store
 from .vpn import VpnExit, make_vpn_exit
 
@@ -44,6 +37,13 @@ def create_app(
     log.info("exits loaded: %s", ", ".join(exits) or "none")
 
     hub = Hub(settings, exits, Store(settings.db_path))
+    # Partagé par l'API et le proxy d'entrée : les échecs des deux comptent ensemble.
+    guard = Guard(
+        settings.auth_max_failures,
+        settings.auth_failure_window_seconds,
+        settings.auth_block_seconds,
+    )
+    proxy = EntryProxy(hub, settings, guard)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -53,7 +53,10 @@ def create_app(
             loops.append(asyncio.create_task(hub.monitor()))
         if settings.sweep_seconds > 0:
             loops.append(asyncio.create_task(hub.sweeper()))
+        if settings.proxy_port is not None:
+            await proxy.start("0.0.0.0", settings.proxy_port)
         yield
+        await proxy.close()
         for task in loops:
             task.cancel()
         await hub.close()
@@ -80,12 +83,8 @@ def create_app(
     def error(status: int, detail: str, **extra) -> JSONResponse:
         return JSONResponse(status_code=status, content={"detail": detail, **extra})
 
-    guard = Guard(
-        settings.auth_max_failures,
-        settings.auth_failure_window_seconds,
-        settings.auth_block_seconds,
-    )
     app.state.guard = guard
+    app.state.proxy = proxy
 
     @app.middleware("http")
     async def block_bad_tokens(request: Request, call_next) -> Response:
@@ -98,7 +97,8 @@ def create_app(
             response.headers["Retry-After"] = str(blocked_for)
             return response
         response = await call_next(request)
-        if response.status_code == 401:
+        # Seul un jeton faux compte : une requête sans jeton n'essaie rien.
+        if response.status_code == 401 and "authorization" in request.headers:
             guard.auth_failed(ip)
         return response
 
@@ -112,23 +112,13 @@ def create_app(
             409, "an operation is already running on this exit", operation_id=exc.operation_id
         )
 
-    @app.exception_handler(ExitInUse)
-    async def exit_in_use(request: Request, exc: ExitInUse) -> JSONResponse:
+    @app.exception_handler(ExitReserved)
+    async def exit_reserved(request: Request, exc: ExitReserved) -> JSONResponse:
         return error(
             409,
-            f"exit has {exc.active_sessions} active sessions, use force=true to rotate anyway",
-            active_sessions=exc.active_sessions,
+            f"exit reserved by session {exc.session_id}, use force=true to rotate anyway",
+            session_id=exc.session_id,
         )
-
-    @app.exception_handler(CountryMismatch)
-    async def country_mismatch(request: Request, exc: CountryMismatch) -> JSONResponse:
-        return error(
-            409, f"exit is in {exc.current}, rotate with ?country= first", country=exc.current
-        )
-
-    @app.exception_handler(ExitDown)
-    async def exit_down(request: Request, exc: ExitDown) -> JSONResponse:
-        return error(503, "exit is down")
 
     @app.exception_handler(CooldownActive)
     async def cooldown(request: Request, exc: CooldownActive) -> JSONResponse:
@@ -172,15 +162,13 @@ def create_app(
         hub.driver(exit_id)
         return hub.store.history(exit_id, limit)
 
-    @api.post("/exits/{exit_id}/sessions", status_code=201)
-    async def open_session(request: Request, exit_id: str, country: Country = None) -> dict:
-        session = await hub.open_session(exit_id, country)
-        session["proxy_url"] = f"http://{request.url.hostname}:{session['proxy_port']}"
-        return session
+    @api.get("/sessions")
+    async def list_sessions() -> list[dict]:
+        return hub.describe_sessions()
 
     @api.delete("/sessions/{session_id}", status_code=204)
-    async def close_session(session_id: str) -> Response:
-        if hub.close_session(session_id) is None:
+    async def release_session(session_id: str) -> Response:
+        if not hub.release_by_id(session_id):
             raise HTTPException(status_code=404, detail="unknown session")
         return Response(status_code=204)
 

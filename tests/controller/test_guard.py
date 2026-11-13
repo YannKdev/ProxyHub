@@ -57,5 +57,10 @@ def test_api_blocks_after_bad_tokens(client, auth):
     assert client.get("/health").status_code == 200
 
 
+def test_missing_token_does_not_count(client, auth):
+    assert [client.get("/exits").status_code for _ in range(5)] == [401] * 5
+    assert client.get("/exits", headers=auth).status_code == 200
+
+
 def test_api_has_no_rate_limit(client, auth):
     assert all(client.get("/exits", headers=auth).status_code == 200 for _ in range(200))

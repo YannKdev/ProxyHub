@@ -22,6 +22,23 @@ def test_settings_from_env():
     assert settings.compose_profiles == []
 
 
+def test_proxy_settings_from_env():
+    settings = load_settings(
+        ENV
+        | {"PROXY_PORT": "9000", "PROXY_CONNECT_PORTS": "443, 8443", "SESSION_IDLE_SECONDS": "60"}
+    )
+    assert settings.proxy_port == 9000
+    assert settings.proxy_connect_ports == [443, 8443]
+    assert settings.session_idle_seconds == 60
+    assert load_settings(ENV).proxy_connect_ports == [80, 443]
+
+
+def test_shipped_exits_have_pools():
+    path = ROOT / "vps" / "config" / "exits.yaml"
+    pools = {e.id: e.pool for e in load_exits(path, ["cyberghost-1", "cyberghost-2"])}
+    assert pools == {"vpn-1": "nordvpn", "cyberghost-1": "cyberghost", "cyberghost-2": "cyberghost"}
+
+
 def test_compose_profiles_from_env():
     settings = load_settings(ENV | {"COMPOSE_PROFILES": "cyberghost-1, other,"})
     assert settings.compose_profiles == ["cyberghost-1", "other"]
@@ -63,10 +80,10 @@ def test_exit_with_inactive_profile_is_skipped(tmp_path):
     path = tmp_path / "exits.yaml"
     path.write_text(
         "exits:\n"
-        "  - {id: vpn-1, type: vpn, proxy_port: 8081, proxy_url: http://g:8888, "
+        "  - {id: vpn-1, type: vpn, pool: p, proxy_port: 8081, proxy_url: http://g:8888, "
         "gluetun_control_url: http://g:8000}\n"
-        "  - {id: vpn-2, type: vpn, profile: extra, proxy_port: 8082, proxy_url: http://h:8888, "
-        "gluetun_control_url: http://h:8000}\n"
+        "  - {id: vpn-2, type: vpn, pool: p, profile: extra, proxy_port: 8082, "
+        "proxy_url: http://h:8888, gluetun_control_url: http://h:8000}\n"
     )
     assert [e.id for e in load_exits(path, ["other"])] == ["vpn-1"]
     assert [e.id for e in load_exits(path, ["other", "extra"])] == ["vpn-1", "vpn-2"]
@@ -74,7 +91,7 @@ def test_exit_with_inactive_profile_is_skipped(tmp_path):
 
 def test_duplicate_exit_ids_are_refused(tmp_path):
     entry = (
-        "  - {id: vpn-1, type: vpn, proxy_port: 8081, proxy_url: http://g:8888, "
+        "  - {id: vpn-1, type: vpn, pool: p, proxy_port: 8081, proxy_url: http://g:8888, "
         "gluetun_control_url: http://g:8000}\n"
     )
     path = tmp_path / "exits.yaml"
@@ -86,7 +103,7 @@ def test_duplicate_exit_ids_are_refused(tmp_path):
 def test_unknown_field_is_refused(tmp_path):
     path = tmp_path / "exits.yaml"
     path.write_text(
-        "exits:\n  - {id: vpn-1, type: vpn, proxy_port: 8081, proxy_url: http://g:8888, "
+        "exits:\n  - {id: vpn-1, type: vpn, pool: p, proxy_port: 8081, proxy_url: http://g:8888, "
         "gluetun_control_url: http://g:8000, cooldown: 5}\n"
     )
     with pytest.raises(ConfigError):

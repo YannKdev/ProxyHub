@@ -9,6 +9,10 @@ class ExitError(Exception):
     pass
 
 
+class CountryRejected(ExitError):
+    """Pays inconnu du fournisseur de cette sortie."""
+
+
 class VpnExit:
     def __init__(
         self,
@@ -33,14 +37,15 @@ class VpnExit:
         countries = response.json()["provider"]["server_selection"]["countries"] or []
         return countries[0] if countries else None
 
-    async def reconnect(self, country: str | None = None) -> None:
-        if country:
+    async def reconnect(self, countries: list[str] | None = None) -> None:
+        """Reconnexion, dans un autre pays si `countries` est donné (noms Gluetun du pays)."""
+        if countries:
             response = await self.control.put(
                 "/v1/vpn/settings",
-                json={"provider": {"server_selection": {"countries": [country]}}},
+                json={"provider": {"server_selection": {"countries": countries}}},
             )
             if response.status_code == 400:
-                raise ExitError(f"gluetun rejected country {country!r}")
+                raise CountryRejected(f"gluetun rejected country {countries[0]!r}")
             response.raise_for_status()
             # Gluetun relance lui-même le VPN quand les réglages changent.
             if "unchanged" not in response.text:

@@ -91,8 +91,10 @@ services:
     logging: *logging
     depends_on:
       - gluetun
-    # Accessible seulement depuis le VPS. De l'extérieur, l'API passe par Caddy (HTTPS).
     ports:
+      # Proxy d'entrée unique : il choisit la sortie d'après le nom d'utilisateur.
+      - "8080:8080"
+      # API accessible seulement depuis le VPS. De l'extérieur, elle passe par Caddy (HTTPS).
       - "127.0.0.1:8090:8090"
     environment:
       API_TOKEN: ${API_TOKEN:?set it in vps/.env}

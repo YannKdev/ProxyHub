@@ -28,6 +28,7 @@ def settings(tmp_path) -> Settings:
         db_path=tmp_path / "proxyhub.db",
         monitor_seconds=0,
         sweep_seconds=0,
+        proxy_port=None,
     )
 
 
@@ -37,6 +38,7 @@ def new_exit():
         options = {
             "id": "vpn-1",
             "type": "vpn",
+            "pool": "nordvpn",
             "proxy_port": 8081,
             "proxy_url": "http://gluetun:8888",
             "gluetun_control_url": "http://gluetun:8000",
@@ -56,6 +58,22 @@ def new_exit():
 def new_hub(settings, new_exit):
     def factory(fake: FakeGluetun, **overrides) -> Hub:
         hub = Hub(settings, {"vpn-1": new_exit(fake, **overrides)}, Store(settings.db_path))
+        hub.startup()
+        return hub
+
+    return factory
+
+
+@pytest.fixture
+def multi_hub(settings, new_exit):
+    """Hub à plusieurs sorties : {id: (FakeGluetun, réglages de la sortie)}."""
+
+    def factory(exits: dict[str, tuple[FakeGluetun, dict]], **settings_overrides) -> Hub:
+        drivers = {
+            exit_id: new_exit(fake, id=exit_id, proxy_port=8081 + i, **overrides)
+            for i, (exit_id, (fake, overrides)) in enumerate(exits.items())
+        }
+        hub = Hub(settings.model_copy(update=settings_overrides), drivers, Store(settings.db_path))
         hub.startup()
         return hub
 

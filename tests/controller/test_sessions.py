@@ -1,9 +1,8 @@
 import asyncio
-from datetime import timedelta
+import time
 
 import pytest
-from app.hub import CountryMismatch, ExitBusy, ExitDown, ExitInUse
-from app.store import utcnow
+from app.hub import ExitReserved, NoFreeExit, SessionFailed
 from fakes.fake_gluetun import FakeGluetun
 
 
@@ -11,165 +10,283 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def test_open_and_close_session(new_hub):
+def two_exits(multi_hub, **settings_overrides):
+    fakes = {
+        "nord": FakeGluetun(["1.1.1.1", "1.1.1.2", "1.1.1.3"]),
+        "cg": FakeGluetun(["2.2.2.1", "2.2.2.2", "2.2.2.3"]),
+    }
+    hub = multi_hub(
+        {"nord": (fakes["nord"], {"pool": "nordvpn"}), "cg": (fakes["cg"], {"pool": "cyberghost"})},
+        **settings_overrides,
+    )
+    return hub, fakes
+
+
+async def checked(hub):
+    await hub.check_all()
+    return hub
+
+
+def test_same_name_same_exit_new_name_other_exit(multi_hub):
     async def scenario():
-        hub = new_hub(FakeGluetun(["1.1.1.1"]))
-        await hub.check_all()
-        session = await hub.open_session("vpn-1")
-        opened = hub.describe("vpn-1")["active_sessions"]
-        hub.close_session(session["session_id"])
-        return hub, session, opened
+        hub = await checked(two_exits(multi_hub)[0])
+        a = await hub.session_for("a", "vpn", None, None)
+        again = await hub.session_for("a", "vpn", None, None)
+        b = await hub.session_for("b", "vpn", None, None)
+        return a, again, b
 
-    hub, session, opened = run(scenario())
-    assert session["ip"] == "1.1.1.1"
-    assert session["proxy_port"] == 8081
-    assert opened == 1
-    assert hub.describe("vpn-1")["active_sessions"] == 0
-    assert hub.describe("vpn-1")["sessions_since_rotation"] == 1
+    a, again, b = run(scenario())
+    assert again is a
+    assert {a.exit_id, b.exit_id} == {"nord", "cg"}
 
 
-def test_close_unknown_session(new_hub):
-    hub = new_hub(FakeGluetun(["1.1.1.1"]))
-    assert hub.close_session("nope") is None
-
-
-def test_session_refused_during_rotation(new_hub):
+def test_no_free_exit_is_refused(multi_hub):
     async def scenario():
-        hub = new_hub(FakeGluetun(["1.1.1.1", "2.2.2.2"]))
-        op = hub.start_rotation("vpn-1")
-        with pytest.raises(ExitBusy) as error:
-            await hub.open_session("vpn-1")
-        await hub.wait_operations()
-        return op["id"], error.value.operation_id
-
-    op_id, reported = run(scenario())
-    assert reported == op_id
-
-
-def test_session_refused_when_exit_down(new_hub):
-    fake = FakeGluetun(["1.1.1.1"])
-
-    async def scenario():
-        hub = new_hub(fake)
-        fake.reachable = False
-        await hub.check_all()
-        with pytest.raises(ExitDown):
-            await hub.open_session("vpn-1")
+        hub = await checked(two_exits(multi_hub)[0])
+        await hub.session_for("a", "vpn", None, None)
+        await hub.session_for("b", "vpn", None, None)
+        with pytest.raises(NoFreeExit):
+            await hub.session_for("c", "vpn", None, None)
 
     run(scenario())
 
 
-def test_session_country_must_match(new_hub):
+def test_pool_limits_the_exits(multi_hub):
     async def scenario():
-        hub = new_hub(FakeGluetun(["1.1.1.1"], country="france"))
-        session = await hub.open_session("vpn-1", country="France")
-        with pytest.raises(CountryMismatch) as error:
-            await hub.open_session("vpn-1", country="Belgium")
-        return session, error.value.current
+        hub = await checked(two_exits(multi_hub)[0])
+        session = await hub.session_for("a", "cyberghost", None, None)
+        with pytest.raises(NoFreeExit):
+            await hub.session_for("b", "cyberghost", None, None)
+        return session
 
-    session, current = run(scenario())
-    assert session["country"] == "france"
-    assert current == "france"
+    assert run(scenario()).exit_id == "cg"
 
 
-def test_rotation_refused_with_active_sessions(new_hub):
+def test_exit_already_in_country_is_used_as_is(multi_hub):
     async def scenario():
-        hub = new_hub(FakeGluetun(["1.1.1.1", "2.2.2.2"]))
-        await hub.open_session("vpn-1")
-        with pytest.raises(ExitInUse) as error:
-            hub.start_rotation("vpn-1")
-        op = hub.start_rotation("vpn-1", force=True)
-        await hub.wait_operations()
-        return error.value.active_sessions, hub.store.operation(op["id"])
-
-    active, op = run(scenario())
-    assert active == 1
-    assert op["status"] == "done"
-
-
-def test_auto_rotation_after_n_sessions(new_hub):
-    async def scenario():
-        hub = new_hub(FakeGluetun(["1.1.1.1", "2.2.2.2"]), rotate_every_sessions=2)
+        hub, fakes = two_exits(multi_hub)
+        fakes["cg"].countries = ["Belgium"]
         await hub.check_all()
-        first = await hub.open_session("vpn-1")
-        hub.close_session(first["session_id"])
-        after_one = "vpn-1" in hub.running
-        second = await hub.open_session("vpn-1")
-        hub.close_session(second["session_id"])
-        op_id = hub.running.get("vpn-1")
-        await hub.wait_operations()
-        return hub, after_one, op_id
+        session = await hub.session_for("a", "vpn", "be", None)
+        return hub, session
 
-    hub, after_one, op_id = run(scenario())
-    assert after_one is False
-    op = hub.store.operation(op_id)
-    assert op["params"]["trigger"] == "auto"
-    assert op["result"]["new_ip"] == "2.2.2.2"
-    assert hub.describe("vpn-1")["sessions_since_rotation"] == 0
+    hub, session = run(scenario())
+    assert session.exit_id == "cg"
+    assert hub.running == {}
+    assert hub.status["cg"].ip == "2.2.2.1"
 
 
-def test_auto_rotation_waits_for_active_sessions(new_hub):
+def test_country_switch_rotates_a_free_exit(multi_hub):
     async def scenario():
-        hub = new_hub(FakeGluetun(["1.1.1.1", "2.2.2.2"]), rotate_every_sessions=2)
+        hub, fakes = two_exits(multi_hub)
         await hub.check_all()
-        sessions = [await hub.open_session("vpn-1") for _ in range(3)]
-        hub.close_session(sessions[0]["session_id"])
-        hub.close_session(sessions[1]["session_id"])
-        while_active = "vpn-1" in hub.running
-        hub.close_session(sessions[2]["session_id"])
-        after_last = "vpn-1" in hub.running
-        await hub.wait_operations()
-        return while_active, after_last
+        session = await hub.session_for("a", "nordvpn", "de", None)
+        return hub, fakes, session
 
-    assert run(scenario()) == (False, True)
+    hub, fakes, session = run(scenario())
+    assert session.exit_id == "nord"
+    assert fakes["nord"].countries == ["Germany"]
+    assert hub.status["nord"].ip == "1.1.1.2"
+    assert hub.status["nord"].country == "Germany"
 
 
-def test_auto_rotation_waits_for_cooldown(new_hub):
+def test_country_unknown_to_a_provider_tries_the_next_exit(multi_hub):
     async def scenario():
-        hub = new_hub(
-            FakeGluetun(["1.1.1.1", "2.2.2.2"]), rotate_every_sessions=1, cooldown_seconds=60
+        hub, fakes = two_exits(multi_hub)
+        fakes["nord"].known = {"france"}
+        await hub.check_all()
+        session = await hub.session_for("a", "vpn", "de", None)
+        return hub, fakes, session
+
+    hub, fakes, session = run(scenario())
+    assert session.exit_id == "cg"
+    assert fakes["nord"].countries == ["france"]
+    assert "nord" not in hub.reserved
+
+
+def test_country_unknown_everywhere_fails(multi_hub):
+    async def scenario():
+        hub, fakes = two_exits(multi_hub)
+        for fake in fakes.values():
+            fake.known = {"france"}
+        await hub.check_all()
+        with pytest.raises(SessionFailed, match="not available"):
+            await hub.session_for("a", "vpn", "de", None)
+        return hub
+
+    hub = run(scenario())
+    assert hub.sessions == {}
+    assert hub.reserved == {}
+
+
+def test_unreachable_country_fails_and_frees_the_exit(multi_hub):
+    async def scenario():
+        hub, fakes = two_exits(multi_hub)
+        fakes["nord"].broken_countries = {"germany"}
+        await hub.check_all()
+        with pytest.raises(SessionFailed, match="switched back"):
+            await hub.session_for("a", "nordvpn", "de", None)
+        return hub, fakes
+
+    hub, fakes = run(scenario())
+    assert hub.reserved == {}
+    assert fakes["nord"].countries == ["france"]
+
+
+def test_down_exit_is_not_given(multi_hub):
+    async def scenario():
+        hub, fakes = two_exits(multi_hub)
+        fakes["nord"].reachable = False
+        await hub.check_all()
+        session = await hub.session_for("a", "vpn", None, None)
+        with pytest.raises(NoFreeExit):
+            await hub.session_for("b", "vpn", None, None)
+        return session
+
+    assert run(scenario()).exit_id == "cg"
+
+
+def test_concurrent_requests_share_one_session(multi_hub):
+    async def scenario():
+        hub = await checked(two_exits(multi_hub)[0])
+        first, second = await asyncio.gather(
+            hub.session_for("a", "nordvpn", "de", None),
+            hub.session_for("a", "nordvpn", "de", None),
         )
-        await hub.check_all()
-        hub.store.save_rotation_time("vpn-1", utcnow() - timedelta(seconds=30))
-        session = await hub.open_session("vpn-1")
-        hub.close_session(session["session_id"])
-        during_cooldown = "vpn-1" in hub.running
-        hub.store.save_rotation_time("vpn-1", utcnow() - timedelta(seconds=90))
-        hub.sweep()
-        after_cooldown = "vpn-1" in hub.running
-        await hub.wait_operations()
-        return during_cooldown, after_cooldown
+        return hub, first, second
 
-    assert run(scenario()) == (False, True)
+    hub, first, second = run(scenario())
+    assert first is second
+    assert len(hub.sessions) == 1
 
 
-def test_expired_sessions_count_for_auto_rotation(new_hub):
+def test_idle_session_is_released_then_exit_rotated(multi_hub):
     async def scenario():
-        hub = new_hub(
-            FakeGluetun(["1.1.1.1", "2.2.2.2"]),
-            rotate_every_sessions=1,
-            session_ttl_seconds=0.01,
-        )
+        hub, fakes = two_exits(multi_hub)
         await hub.check_all()
-        session = await hub.open_session("vpn-1")
-        await asyncio.sleep(0.02)
+        session = await hub.session_for("a", "nordvpn", None, None)
         hub.sweep()
-        started = "vpn-1" in hub.running
+        kept = session.key in hub.sessions
+        session.last_seen = time.monotonic() - 1000
+        hub.sweep()
+        released = session.key not in hub.sessions and "nord" in hub.stale
+        hub.sweep()
+        op_id = hub.running["nord"]
         await hub.wait_operations()
-        return hub.store.session(session["session_id"]), started
+        return hub, kept, released, hub.store.operation(op_id)
 
-    session, started = run(scenario())
-    assert session["close_reason"] == "expired"
-    assert started is True
+    hub, kept, released, op = run(scenario())
+    assert kept
+    assert released
+    assert op["params"] == {"country": None, "trigger": "release"}
+    assert hub.status["nord"].ip == "1.1.1.2"
+    assert "nord" not in hub.stale
 
 
-def test_no_auto_rotation_without_setting(new_hub):
+def test_session_with_open_connections_is_kept(multi_hub):
     async def scenario():
-        hub = new_hub(FakeGluetun(["1.1.1.1", "2.2.2.2"]))
-        for _ in range(5):
-            session = await hub.open_session("vpn-1")
-            hub.close_session(session["session_id"])
+        hub = await checked(two_exits(multi_hub)[0])
+        session = await hub.session_for("a", "nordvpn", None, None)
+        session.enter()
+        session.last_seen = time.monotonic() - 1000
         hub.sweep()
-        return "vpn-1" in hub.running
+        return hub, session
 
-    assert run(scenario()) is False
+    hub, session = run(scenario())
+    assert session.key in hub.sessions
+
+
+def test_hold_extends_the_idle_delay(multi_hub):
+    async def scenario():
+        hub = await checked(two_exits(multi_hub, session_idle_seconds=300)[0])
+        session = await hub.session_for("a", "nordvpn", None, 60)
+        session.last_seen = time.monotonic() - 1000
+        hub.sweep()
+        return hub, session
+
+    hub, session = run(scenario())
+    assert session.idle_seconds == 3600
+    assert session.key in hub.sessions
+
+
+def test_stale_exit_is_rotated_before_reuse(multi_hub):
+    async def scenario():
+        hub = await checked(two_exits(multi_hub)[0])
+        first = await hub.session_for("a", "nordvpn", None, None)
+        hub.release(first, "test")
+        second = await hub.session_for("b", "nordvpn", None, None)
+        return hub, second
+
+    hub, second = run(scenario())
+    assert second.exit_id == "nord"
+    assert hub.status["nord"].ip == "1.1.1.2"
+    assert "nord" not in hub.stale
+
+
+def test_fresh_exit_is_preferred_to_a_stale_one(multi_hub):
+    async def scenario():
+        hub = await checked(two_exits(multi_hub)[0])
+        first = await hub.session_for("a", "vpn", None, None)
+        first_exit = first.exit_id
+        hub.release(first, "test")
+        second = await hub.session_for("b", "vpn", None, None)
+        return hub, first_exit, second
+
+    hub, first_exit, second = run(scenario())
+    assert second.exit_id != first_exit
+    assert hub.running == {}
+
+
+def test_release_by_id_cancels_connections(multi_hub):
+    async def scenario():
+        hub = await checked(two_exits(multi_hub)[0])
+        session = await hub.session_for("a", "nordvpn", None, None)
+
+        async def connection():
+            session.enter()
+            try:
+                await asyncio.sleep(10)
+            finally:
+                session.leave()
+
+        task = asyncio.create_task(connection())
+        await asyncio.sleep(0)
+        assert hub.release_by_id(session.id)
+        assert not hub.release_by_id(session.id)
+        await asyncio.gather(task, return_exceptions=True)
+        return hub, task
+
+    hub, task = run(scenario())
+    assert task.cancelled()
+    assert hub.sessions == {}
+
+
+def test_admin_rotation_of_reserved_exit_needs_force(multi_hub):
+    async def scenario():
+        hub = await checked(two_exits(multi_hub)[0])
+        session = await hub.session_for("a", "nordvpn", None, None)
+        with pytest.raises(ExitReserved) as error:
+            hub.start_rotation("nord")
+        hub.start_rotation("nord", force=True)
+        await hub.wait_operations()
+        return hub, session, error.value
+
+    hub, session, error = run(scenario())
+    assert error.session_id == session.id
+    assert hub.reserved["nord"] is session
+    assert hub.status["nord"].ip == "1.1.1.2"
+
+
+def test_describe_shows_sessions(multi_hub):
+    async def scenario():
+        hub = await checked(two_exits(multi_hub)[0])
+        session = await hub.session_for("a", "cyberghost", None, None)
+        return hub, session
+
+    hub, session = run(scenario())
+    assert hub.describe("cg")["session_id"] == session.id
+    assert hub.describe("nord")["session_id"] is None
+    [info] = hub.describe_sessions()
+    assert info["label"] == "a"
+    assert info["exit"] == "cg"
+    assert info["release_after_seconds"] == 300

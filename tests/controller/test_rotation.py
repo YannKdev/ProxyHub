@@ -106,6 +106,27 @@ def test_exit_not_coming_back_fails(rotate):
     assert hub.status["vpn-1"].state == "down"
 
 
+def test_unreachable_country_switches_back(rotate):
+    fake = FakeGluetun(["1.1.1.1", "2.2.2.2"], country="france")
+    fake.broken_countries = {"belgium"}
+    hub, op = rotate(fake, country="Belgium", max_attempts=2)
+
+    assert op["status"] == "failed"
+    assert op["error"] == "exit did not come back in Belgium, switched back to france"
+    assert fake.countries == ["france"]
+    assert hub.status["vpn-1"].state == "up"
+    assert hub.status["vpn-1"].country == "france"
+
+
+def test_switch_back_that_fails_says_so(rotate):
+    fake = FakeGluetun(["1.1.1.1", "2.2.2.2"], country="france")
+    fake.broken_countries = {"belgium", "france"}
+    hub, op = rotate(fake, country="Belgium", max_attempts=1)
+
+    assert op["error"].endswith("switched back to france, still down")
+    assert hub.status["vpn-1"].state == "down"
+
+
 def test_second_rotation_while_running_is_refused(new_hub):
     async def scenario():
         hub = new_hub(FakeGluetun(["1.1.1.1", "2.2.2.2"]))

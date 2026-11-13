@@ -72,14 +72,26 @@ docker compose restart gluetun-cyberghost-1 gluetun-cyberghost-2
 
 ## Proxy d'entrée
 
-Un seul compte (`PROXY_USER`, `PROXY_PASSWORD`), des options ajoutées au nom d'utilisateur :
+Un seul compte (`PROXY_USER`, `PROXY_PASSWORD`), options dans le nom d'utilisateur.
 
-```text
-http://USER:PASS@VPS:8080                                  une sortie VPN, gardée par IP de client
-http://USER-session-a1:PASS@VPS:8080                       session a1 : même sortie, même IP
-http://USER-session-a2:PASS@VPS:8080                       session a2 : autre sortie, autre IP
-http://USER-pool-cyberghost-country-be-session-x:PASS@VPS:8080
-http://USER-session-x-hold-60:PASS@VPS:8080                garde la sortie 60 min sans trafic
+```sh
+curl -x http://USER:PASS@VPS:8080 https://api.ipify.org                    # une sortie VPN, gardée par IP du client
+curl -x http://USER-session-a1:PASS@VPS:8080 https://api.ipify.org         # session a1 : même IP à chaque appel
+curl -x http://USER-session-a2:PASS@VPS:8080 https://api.ipify.org         # nouvelle session : autre IP
+curl -x http://USER-pool-cyberghost-country-be-session-x:PASS@VPS:8080 https://api.ipify.org
+curl -x http://USER-session-x-hold-60:PASS@VPS:8080 https://api.ipify.org  # sortie gardée 60 min sans trafic
+```
+
+```python
+import requests
+from urllib.parse import quote
+
+user = "USER-pool-cyberghost-country-be-session-job1-hold-30"   # options du tableau, toutes facultatives
+proxy = f"http://{quote(user, safe='')}:{quote('PASS', safe='')}@VPS:8080"
+proxies = {"http": proxy, "https": proxy}
+
+print(requests.get("https://api.ipify.org", proxies=proxies, timeout=60).text)  # IP de sortie
+# même session = même IP ; session-job2 = autre IP
 ```
 
 | Option | Valeurs |
@@ -87,23 +99,23 @@ http://USER-session-x-hold-60:PASS@VPS:8080                garde la sortie 60 mi
 | `pool` | `nordvpn`, `cyberghost`, `vpn` (toutes les sorties VPN, par défaut), `mobile` (à venir) |
 | `country` | code à deux lettres : `fr`, `be`, `de`, `gb`… |
 | `session` | 1 à 64 lettres, chiffres ou `_`, choisi par le client |
-| `hold` | minutes de réservation sans trafic (5 min par défaut, 24 h au plus) |
+| `hold` | minutes de réservation sans trafic (5 par défaut, 1440 au plus) |
 
-```sh
-curl -x http://USER-session-a1:PASS@VPS:8080 https://api.ipify.org
-curl -x http://USER-session-a1:PASS@VPS:8080 https://api.ipify.org   # même IP
-curl -x http://USER-session-a2:PASS@VPS:8080 https://api.ipify.org   # autre IP
-```
+- une session = une sortie réservée, que personne d'autre ne fait tourner
+- même `session` avec un autre `pool` ou `country` : autre session
+- libérée après 5 min sans connexion (ou `hold`), puis la sortie tourne
+- pays absent des sorties libres : une sortie change de pays (≈ 20 s à la première connexion)
+- autant de sessions simultanées que de sorties ; IP gardée au mieux (une panne du VPN la change)
 
-- une session réserve une sortie pour elle seule : personne d'autre ne la fait tourner
-- clé de session : `session` (ou IP du client) + `pool` + `country`
-- libérée après 5 min sans connexion ouverte (ou `hold`), puis la sortie tourne : IP neuve pour la session suivante
-- pays : sortie libre déjà dans ce pays, sinon une sortie libre change de pays (≈ 20 s d'attente à la première connexion)
-- 503 : plus de sortie libre dans le groupe, réessayer (`Retry-After`) ; autant de sessions que de sorties
-- 502 : pays injoignable ou inconnu des fournisseurs du groupe ; 504 : sortie pas prête à temps, réessayer
-- 400 : option inconnue ou mal écrite ; 407 : identifiants faux ; 403 : port autre que 80 et 443, adresse privée
-- 429 : IP bloquée 30 min après 5 mauvais mots de passe (proxy et API comptent ensemble)
-- IP gardée au mieux : si le VPN d'une sortie se reconnecte (panne), la session garde la sortie mais l'IP change
+| Code | Cause |
+| --- | --- |
+| 400 | option inconnue ou mal écrite |
+| 403 | port autre que 80 et 443, adresse privée |
+| 407 | identifiants faux |
+| 429 | IP bloquée 30 min après 5 mauvais mots de passe (proxy et API ensemble) |
+| 502 | pays injoignable ou inconnu des sorties du groupe |
+| 503 | plus de sortie libre, réessayer (`Retry-After`) |
+| 504 | sortie pas prête à temps, réessayer |
 
 ## Vérifier
 

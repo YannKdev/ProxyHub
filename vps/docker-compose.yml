@@ -85,6 +85,39 @@ services:
       OPENVPN_KEY: ${CYBERGHOST_2_KEY:-${CYBERGHOST_KEY:-}}
       SERVER_COUNTRIES: ${CYBERGHOST_2_COUNTRIES:-${CYBERGHOST_COUNTRIES:-France}}
 
+  # Accès direct depuis le VPS seulement : les clients passent par le proxy d'entrée (8080).
+  gluetun-cyberghost-3:
+    <<: *gluetun
+    profiles:
+      - cyberghost-3
+    ports:
+      - "127.0.0.1:8084:8888"
+    volumes:
+      - gluetun-cyberghost-3-data:/gluetun
+    environment:
+      <<: *cyberghost-env
+      OPENVPN_USER: ${CYBERGHOST_3_USER:-${CYBERGHOST_USER:-}}
+      OPENVPN_PASSWORD: ${CYBERGHOST_3_PASSWORD:-${CYBERGHOST_PASSWORD:-}}
+      OPENVPN_CERT: ${CYBERGHOST_3_CERT:-${CYBERGHOST_CERT:-}}
+      OPENVPN_KEY: ${CYBERGHOST_3_KEY:-${CYBERGHOST_KEY:-}}
+      SERVER_COUNTRIES: ${CYBERGHOST_3_COUNTRIES:-${CYBERGHOST_COUNTRIES:-France}}
+
+  gluetun-cyberghost-4:
+    <<: *gluetun
+    profiles:
+      - cyberghost-4
+    ports:
+      - "127.0.0.1:8085:8888"
+    volumes:
+      - gluetun-cyberghost-4-data:/gluetun
+    environment:
+      <<: *cyberghost-env
+      OPENVPN_USER: ${CYBERGHOST_4_USER:-${CYBERGHOST_USER:-}}
+      OPENVPN_PASSWORD: ${CYBERGHOST_4_PASSWORD:-${CYBERGHOST_PASSWORD:-}}
+      OPENVPN_CERT: ${CYBERGHOST_4_CERT:-${CYBERGHOST_CERT:-}}
+      OPENVPN_KEY: ${CYBERGHOST_4_KEY:-${CYBERGHOST_KEY:-}}
+      SERVER_COUNTRIES: ${CYBERGHOST_4_COUNTRIES:-${CYBERGHOST_COUNTRIES:-France}}
+
   controller:
     build: ./controller
     restart: unless-stopped
@@ -131,6 +164,8 @@ volumes:
   gluetun-data:
   gluetun-cyberghost-1-data:
   gluetun-cyberghost-2-data:
+  gluetun-cyberghost-3-data:
+  gluetun-cyberghost-4-data:
   controller-data:
   caddy-data:
   caddy-config:

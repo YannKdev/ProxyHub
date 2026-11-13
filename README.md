@@ -7,7 +7,7 @@ Le téléphone est derrière le NAT de l'opérateur : c'est le Raspberry Pi qui 
 ```text
 scripts ──> VPS:8080 (proxy d'entrée) ──> Gluetun ──> NordVPN         vpn-1
                                       ──> Gluetun ──> CyberGhost      cyberghost-1 (facultatif)
-                                      ──> Gluetun ──> CyberGhost      cyberghost-2 (facultatif)
+                                      ──> Gluetun ──> CyberGhost      cyberghost-2 à -4 (facultatifs)
                                       ──> tunnel SSH ──> Pi ──> 4G    (à venir)
 admin   ──> https://<domaine> ──> Caddy ──> API : état, IP, historique, sessions
 ```
@@ -24,7 +24,7 @@ docker compose up -d --build
 docker compose ps
 ```
 
-Ports à ouvrir : 80 et 443 (Caddy, certificat Let's Encrypt), 8080 (proxy d'entrée). 8081 à 8083 : accès direct à une sortie, publics pendant la migration des scripts.
+Ports à ouvrir : 80 et 443 (Caddy, certificat Let's Encrypt), 8080 (proxy d'entrée). 8081 à 8083 : accès direct à une sortie, publics pendant la migration des scripts (8084 et 8085 : depuis le VPS seulement).
 
 Mise à jour (pull, vérification du `.env`, reconstruction, smoke test) :
 
@@ -52,22 +52,23 @@ openssl pkey -in client.key | sed '1d;$d' | tr -d '\n'   # -> CYBERGHOST_KEY
 sed -n '/<cert>/,/<\/cert>/p' openvpn.ovpn | openssl x509 | sed '1d;$d' | tr -d '\n'
 sed -n '/<key>/,/<\/key>/p' openvpn.ovpn | openssl pkey | sed '1d;$d' | tr -d '\n'
 
-nano .env                     # décommenter le bloc CyberGhost, COMPOSE_PROFILES=cyberghost-1,cyberghost-2
-./scripts/update.sh           # ou docker compose up -d : démarre gluetun-cyberghost-1 et -2
+nano .env                     # décommenter le bloc CyberGhost, COMPOSE_PROFILES=cyberghost-1,...,cyberghost-4
+./scripts/update.sh           # ou docker compose up -d : démarre les gluetun-cyberghost-N
 
 # liste de serveurs intégrée à Gluetun périmée (IP qui ne répondent plus) : la mettre à jour
 # une fois après la première installation, ensuite UPDATER_PERIOD le fait toutes les 24 h
-for s in gluetun-cyberghost-1 gluetun-cyberghost-2; do
+# (à refaire pour chaque nouvelle sortie : son volume part de la liste intégrée)
+for s in $(docker compose ps --services | grep cyberghost); do
   docker compose exec -T $s /gluetun-entrypoint update -enduser -providers cyberghost </dev/null
+  docker compose restart $s
 done
-docker compose restart gluetun-cyberghost-1 gluetun-cyberghost-2
 ```
 
-- profils = id des sorties : `cyberghost-1` (8082), `cyberghost-2` (8083), un seul ou les deux
-- `cyberghost-2` reprend les `CYBERGHOST_*`, sauf les `CYBERGHOST_2_*` définis (deuxième configuration manuelle)
+- profils = id des sorties : `cyberghost-1` à `cyberghost-4`, au choix
+- `cyberghost-N` reprend les `CYBERGHOST_*`, sauf les `CYBERGHOST_N_*` définis (autre configuration manuelle)
 - une même configuration manuelle sert plusieurs connexions simultanées (testé avec deux)
 - désactiver : retirer le profil de `COMPOSE_PROFILES`, puis `docker compose rm -sf gluetun-cyberghost-2 && docker compose up -d`
-- pays de départ : `CYBERGHOST_COUNTRIES`, `CYBERGHOST_2_COUNTRIES` (France par défaut)
+- pays de départ : `CYBERGHOST_COUNTRIES`, `CYBERGHOST_N_COUNTRIES` (France par défaut)
 - 7 connexions simultanées par abonnement : chaque conteneur en prend une, quel que soit le nombre de scripts derrière
 
 ## Proxy d'entrée

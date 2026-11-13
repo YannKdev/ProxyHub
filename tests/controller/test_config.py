@@ -33,10 +33,13 @@ def test_proxy_settings_from_env():
     assert load_settings(ENV).proxy_connect_ports == [80, 443]
 
 
+CYBERGHOST = [f"cyberghost-{n}" for n in range(1, 5)]
+
+
 def test_shipped_exits_have_pools():
     path = ROOT / "vps" / "config" / "exits.yaml"
-    pools = {e.id: e.pool for e in load_exits(path, ["cyberghost-1", "cyberghost-2"])}
-    assert pools == {"vpn-1": "nordvpn", "cyberghost-1": "cyberghost", "cyberghost-2": "cyberghost"}
+    pools = {e.id: e.pool for e in load_exits(path, CYBERGHOST)}
+    assert pools == {"vpn-1": "nordvpn"} | dict.fromkeys(CYBERGHOST, "cyberghost")
 
 
 def test_compose_profiles_from_env():
@@ -59,9 +62,9 @@ def test_shipped_exits_file_is_valid():
     path = ROOT / "vps" / "config" / "exits.yaml"
     assert [e.id for e in load_exits(path)] == ["vpn-1"]
     assert [e.id for e in load_exits(path, ["cyberghost-2"])] == ["vpn-1", "cyberghost-2"]
-    all_exits = load_exits(path, ["cyberghost-1", "cyberghost-2"])
-    assert [e.id for e in all_exits] == ["vpn-1", "cyberghost-1", "cyberghost-2"]
-    assert len({e.proxy_port for e in all_exits}) == 3
+    all_exits = load_exits(path, CYBERGHOST)
+    assert [e.id for e in all_exits] == ["vpn-1", *CYBERGHOST]
+    assert len({e.proxy_port for e in all_exits}) == 5
 
 
 def test_shipped_profiles_match_compose():
@@ -72,7 +75,9 @@ def test_shipped_profiles_match_compose():
         proxy = urlsplit(exit.proxy_url)
         service = compose["services"][proxy.hostname]
         assert urlsplit(exit.gluetun_control_url).hostname == proxy.hostname
-        assert f"{exit.proxy_port}:{proxy.port}" in service["ports"]
+        # Publié pour tous ("8081:8888") ou pour le VPS seul ("127.0.0.1:8084:8888").
+        published = {port.removeprefix("127.0.0.1:") for port in service["ports"]}
+        assert f"{exit.proxy_port}:{proxy.port}" in published
         assert service.get("profiles", [None]) == [exit.profile]
 
 

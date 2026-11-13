@@ -18,7 +18,7 @@ fail() { echo "FAIL $1"; failed=1; }
 
 # Sorties à vérifier : id:port. Les sorties facultatives, si leur profil (= leur id) est actif.
 exits_to_check="vpn-1:8081"
-for entry in cyberghost-1:8082 cyberghost-2:8083; do
+for entry in cyberghost-1:8082 cyberghost-2:8083 cyberghost-3:8084 cyberghost-4:8085; do
   case ",${COMPOSE_PROFILES:-}," in
     *",${entry%:*},"*) exits_to_check="$exits_to_check $entry" ;;
   esac

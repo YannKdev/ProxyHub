@@ -32,3 +32,21 @@ exits:
     gluetun_control_url: http://gluetun-cyberghost-2:8000
     cooldown_seconds: 30
     max_attempts: 3
+  - id: cyberghost-3
+    type: vpn
+    pool: cyberghost
+    profile: cyberghost-3
+    proxy_port: 8084
+    proxy_url: http://gluetun-cyberghost-3:8888
+    gluetun_control_url: http://gluetun-cyberghost-3:8000
+    cooldown_seconds: 30
+    max_attempts: 3
+  - id: cyberghost-4
+    type: vpn
+    pool: cyberghost
+    profile: cyberghost-4
+    proxy_port: 8085
+    proxy_url: http://gluetun-cyberghost-4:8888
+    gluetun_control_url: http://gluetun-cyberghost-4:8000
+    cooldown_seconds: 30
+    max_attempts: 3

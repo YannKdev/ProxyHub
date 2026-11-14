@@ -100,6 +100,13 @@ else
     || fail "entry proxy second session returned $code, expected 503"
 fi
 
+ip1_moved=$(through "$s1-ip-2")
+if [ -n "$ip1_moved" ] && [ "$ip1_moved" != "$ip1" ]; then
+  ok "entry proxy gives a session a new IP with -ip-2 ($ip1_moved)"
+else
+  fail "entry proxy -ip-2 IP: '$ip1_moved' (was '$ip1')"
+fi
+
 # Un seul essai faux : chaque mauvais mot de passe compte pour le blocage de l'IP (5 en 10 min).
 for creds in "" "$PROXY_USER:wrong@"; do
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -x "http://$creds$entry" "http://example.com" || true)

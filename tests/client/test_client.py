@@ -78,6 +78,9 @@ def test_proxy_url_options():
         "@api.example.org:8080"
     )
     assert hub.proxy_url(session=7).startswith("http://user-session-7:")
+    assert hub.proxy_url(session="a", ip=3).startswith("http://user-session-a-ip-3:")
+    with pytest.raises(ValueError):
+        hub.proxy_url(session="a", ip=0)
 
 
 @pytest.mark.parametrize("session", ["a-b", "", "x" * 65, "é"])

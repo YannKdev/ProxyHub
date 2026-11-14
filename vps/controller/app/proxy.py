@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 from .config import Settings
 from .countries import COUNTRIES
 from .guard import Guard
-from .hub import DEFAULT_POOL, Hub, NoFreeExit, Session, SessionFailed
+from .hub import DEFAULT_POOL, Hub, NoFreeExit, Session, SessionFailed, SessionMoved
 
 log = logging.getLogger("proxyhub")
 
@@ -27,6 +27,7 @@ OPTION_PATTERNS = {
     "country": re.compile(r"[a-z]{2}"),
     "session": re.compile(r"[A-Za-z0-9_]{1,64}"),
     "hold": re.compile(r"[1-9][0-9]{0,4}"),
+    "ip": re.compile(r"[1-9][0-9]{0,8}"),
 }
 HOP_BY_HOP = {"proxy-authorization", "proxy-connection", "connection", "keep-alive"}
 
@@ -44,6 +45,7 @@ class Options:
     pool: str = DEFAULT_POOL
     country: str | None = None
     hold: int | None = None
+    ip: int | None = None
 
 
 @dataclass
@@ -86,7 +88,7 @@ def parse_username(username: str, user: str) -> Options | None:
             raise ProxyError(400, f"invalid value for proxy option {key!r}")
         if key == "country" and value not in COUNTRIES:
             raise ProxyError(400, f"unknown country code {value!r}")
-        setattr(options, key, int(value) if key == "hold" else value)
+        setattr(options, key, int(value) if key in ("hold", "ip") else value)
     return options
 
 
@@ -242,11 +244,13 @@ class EntryProxy:
         name = options.session or f"ip:{client_ip}"
         try:
             return await asyncio.wait_for(
-                self.hub.session_for(name, options.pool, options.country, options.hold),
+                self.hub.session_for(name, options.pool, options.country, options.hold, options.ip),
                 self.settings.proxy_wait_seconds,
             )
         except NoFreeExit as e:
             raise ProxyError(503, str(e), {"Retry-After": "10"}) from None
+        except SessionMoved as e:
+            raise ProxyError(409, f"{e}, use -ip-{e.current} or higher") from None
         except SessionFailed as e:
             raise ProxyError(502, str(e)) from None
         except TimeoutError:

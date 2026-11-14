@@ -21,6 +21,9 @@ with hub.proxy(session="example1") as s:
     print("session example1:", s.get(IP_SERVICE, timeout=30).text)
     print("same session:    ", s.get(IP_SERVICE, timeout=30).text)
 
+with hub.proxy(session="example1", ip=2) as s:
+    print("example1, ip 2:  ", s.get(IP_SERVICE, timeout=60).text)
+
 with hub.proxy(session="example2", pool="cyberghost", country="be", hold=10) as s:
     print("session example2 (cyberghost, be):", s.get(IP_SERVICE, timeout=60).text)
 

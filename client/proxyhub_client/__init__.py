@@ -48,12 +48,15 @@ class ProxyHub:
         pool: str | None = None,
         country: str | None = None,
         hold: int | None = None,
+        ip: int | None = None,
     ) -> str:
         """URL du proxy d'entrée. Même `session` = même sortie, donc même IP ; nouvelle
         `session` = autre IP. Sans `session`, le VPS garde une session par IP de client.
 
         pool : nordvpn, cyberghost, mobile ou vpn (défaut). country : code à deux lettres.
         hold : minutes pendant lesquelles la sortie reste réservée sans trafic.
+        ip : numéro d'IP de la session ; le passer à un nombre plus grand libère la sortie
+        et donne une IP neuve (la session ne tient jamais plus d'une sortie).
         """
         if not self.proxy_user or not self.proxy_password:
             raise ValueError("proxy_user and proxy_password are needed to use the proxy")
@@ -66,6 +69,10 @@ class ProxyHub:
             if not SESSION_PATTERN.fullmatch(str(session)):
                 raise ValueError("session must be 1 to 64 letters, digits or underscores")
             options += ["session", str(session)]
+        if ip is not None:
+            if int(ip) < 1:
+                raise ValueError("ip must be a positive number")
+            options += ["ip", str(int(ip))]
         if hold:
             options += ["hold", str(int(hold))]
         user = quote("-".join([self.proxy_user, *options]), safe="")
@@ -77,9 +84,10 @@ class ProxyHub:
         pool: str | None = None,
         country: str | None = None,
         hold: int | None = None,
+        ip: int | None = None,
     ) -> requests.Session:
         """requests.Session qui passe par le proxy d'entrée (voir `proxy_url`)."""
-        url = self.proxy_url(session, pool, country, hold)
+        url = self.proxy_url(session, pool, country, hold, ip)
         http = requests.Session()
         http.trust_env = False
         http.proxies = {"http": url, "https": url}

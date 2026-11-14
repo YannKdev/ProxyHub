@@ -22,4 +22,5 @@ def ip_through(options: str) -> str:
 print("direct:          ", requests.get(IP_SERVICE, timeout=15).text)
 print("session a:       ", ip_through("-session-a"))
 print("session a again: ", ip_through("-session-a"))
+print("session a, ip 2: ", ip_through("-session-a-ip-2"))  # IP neuve, a lâche son ancienne sortie
 print("session b:       ", ip_through("-session-b"))

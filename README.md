@@ -79,6 +79,7 @@ Un seul compte (`PROXY_USER`, `PROXY_PASSWORD`), options dans le nom d'utilisate
 curl -x http://USER:PASS@VPS:8080 https://api.ipify.org                    # une sortie VPN, gardée par IP du client
 curl -x http://USER-session-a1:PASS@VPS:8080 https://api.ipify.org         # session a1 : même IP à chaque appel
 curl -x http://USER-session-a2:PASS@VPS:8080 https://api.ipify.org         # nouvelle session : autre IP
+curl -x http://USER-session-a1-ip-2:PASS@VPS:8080 https://api.ipify.org    # a1 change d'IP, lâche sa sortie
 curl -x http://USER-pool-cyberghost-country-be-session-x:PASS@VPS:8080 https://api.ipify.org
 curl -x http://USER-session-x-hold-60:PASS@VPS:8080 https://api.ipify.org  # sortie gardée 60 min sans trafic
 ```
@@ -87,12 +88,12 @@ curl -x http://USER-session-x-hold-60:PASS@VPS:8080 https://api.ipify.org  # sor
 import requests
 from urllib.parse import quote
 
-user = "USER-pool-cyberghost-country-be-session-job1-hold-30"   # options du tableau, toutes facultatives
+user = "USER-pool-cyberghost-country-be-session-job1-ip-1"     # options du tableau, toutes facultatives
 proxy = f"http://{quote(user, safe='')}:{quote('PASS', safe='')}@VPS:8080"
 proxies = {"http": proxy, "https": proxy}
 
 print(requests.get("https://api.ipify.org", proxies=proxies, timeout=60).text)  # IP de sortie
-# même session = même IP ; session-job2 = autre IP
+# même nom = même IP ; ip-2, ip-3… = IP neuve pour la même session
 ```
 
 | Option | Valeurs |
@@ -100,9 +101,11 @@ print(requests.get("https://api.ipify.org", proxies=proxies, timeout=60).text)  
 | `pool` | `nordvpn`, `cyberghost`, `vpn` (toutes les sorties VPN, par défaut), `mobile` (à venir) |
 | `country` | code à deux lettres : `fr`, `be`, `de`, `gb`… |
 | `session` | 1 à 64 lettres, chiffres ou `_`, choisi par le client |
+| `ip` | numéro d'IP de la session : un numéro plus grand donne une IP neuve, un plus petit est refusé (409) |
 | `hold` | minutes de réservation sans trafic (5 par défaut, 1440 au plus) |
 
 - une session = une sortie réservée, que personne d'autre ne fait tourner
+- changer d'IP souvent : garder la session et augmenter `ip` (une sortie au plus par session) ; une nouvelle `session` garde l'ancienne réservée 5 min
 - même `session` avec un autre `pool` ou `country` : autre session
 - libérée après 5 min sans connexion (ou `hold`), puis la sortie tourne
 - pays absent des sorties libres : une sortie change de pays (≈ 20 s à la première connexion)
@@ -111,6 +114,7 @@ print(requests.get("https://api.ipify.org", proxies=proxies, timeout=60).text)  
 | Code | Cause |
 | --- | --- |
 | 400 | option inconnue ou mal écrite |
+| 409 | `ip` plus petit que celui de la session |
 | 403 | port autre que 80 et 443, adresse privée |
 | 407 | identifiants faux |
 | 429 | IP bloquée 30 min après 5 mauvais mots de passe (proxy et API ensemble) |
@@ -169,6 +173,9 @@ with hub.proxy(session="job1") as s:                       # requests.Session pa
     s.get("https://example.org")
 
 with hub.proxy(session="job2", pool="cyberghost", country="be", hold=30) as s:
+    s.get("https://example.org")
+
+with hub.proxy(session="job1", ip=2) as s:                 # même session, IP neuve
     s.get("https://example.org")
 
 hub.proxy_url(session="job3")                              # URL du proxy, pour un autre outil

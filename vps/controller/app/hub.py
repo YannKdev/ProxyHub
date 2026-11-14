@@ -51,6 +51,14 @@ class SessionFailed(Exception):
     pass
 
 
+class SessionMoved(Exception):
+    """Numéro d'IP plus petit que celui où la session est déjà passée."""
+
+    def __init__(self, current: int):
+        super().__init__(f"session already moved to ip {current}")
+        self.current = current
+
+
 class _ExitUnavailable(Exception):
     pass
 
@@ -78,6 +86,8 @@ class Session:
     idle_seconds: float
     created_at: str
     exit_id: str | None = None
+    # Option -ip-<n> : un numéro plus grand demande une IP neuve pour la même session.
+    ip_number: int = 0
     last_seen: float = field(default_factory=time.monotonic)
     connections: int = 0
     tasks: set[asyncio.Task] = field(default_factory=set)
@@ -104,6 +114,7 @@ class Session:
             "exit": self.exit_id,
             "pool": self.pool,
             "country": self.country,
+            "ip_number": self.ip_number,
             "connections": self.connections,
             "idle_seconds": idle,
             "release_after_seconds": round(self.idle_seconds),
@@ -175,15 +186,43 @@ class Hub:
         return [session.describe() for session in self.sessions.values()]
 
     async def session_for(
-        self, name: str, pool: str, country: str | None, hold_minutes: int | None
+        self,
+        name: str,
+        pool: str,
+        country: str | None,
+        hold_minutes: int | None,
+        ip_number: int | None = None,
     ) -> Session:
-        """Session existante pour cette clé, ou nouvelle réservation d'une sortie libre."""
+        """Session existante pour cette clé, ou nouvelle réservation d'une sortie libre.
+
+        `ip_number` plus grand que celui de la session : la session lâche sa sortie et en
+        réserve une autre (ou la même après rotation), donc une IP neuve.
+        """
         key = (name, pool, country)
         idle = self.settings.session_idle_seconds
         if hold_minutes:
             idle = max(idle, min(hold_minutes, self.settings.max_hold_minutes) * 60)
         session = self.sessions.get(key)
-        if session is None:
+        if session is not None:
+            # La session peut être en train de changer de sortie : attendre la fin.
+            while not session.ready.is_set():
+                await session.ready.wait()
+            if isinstance(session.failure, NoFreeExit):
+                raise NoFreeExit(str(session.failure))
+            if session.failure:
+                raise SessionFailed(str(session.failure))
+            if ip_number is not None and ip_number < session.ip_number:
+                raise SessionMoved(session.ip_number)
+            if ip_number is None or ip_number == session.ip_number:
+                session.idle_seconds = idle
+                session.last_seen = time.monotonic()
+                return session
+            event = "renewed"
+            old_exit = session.exit_id
+            self._vacate(session)
+            session.ready.clear()
+        else:
+            event, old_exit = "opened", None
             session = Session(
                 id=uuid.uuid4().hex[:12],
                 key=key,
@@ -194,28 +233,27 @@ class Hub:
                 created_at=utcnow().isoformat(),
             )
             self.sessions[key] = session
-            try:
-                await self._assign(session)
-            except BaseException as e:
-                session.failure = e if isinstance(e, Exception) else SessionFailed("interrupted")
+        session.ip_number = ip_number or 0
+        session.idle_seconds = idle
+        try:
+            await self._assign(session)
+        except BaseException as e:
+            session.failure = e if isinstance(e, Exception) else SessionFailed("interrupted")
+            if self.sessions.get(key) is session:
                 del self.sessions[key]
-                raise
-            finally:
-                session.ready.set()
-            log.info(
-                "session opened session=%s exit=%s pool=%s country=%s",
-                session.id,
-                session.exit_id,
-                pool,
-                country,
-            )
-        else:
-            await session.ready.wait()
-            if isinstance(session.failure, NoFreeExit):
-                raise NoFreeExit(str(session.failure))
-            if session.failure:
-                raise SessionFailed(str(session.failure))
-            session.idle_seconds = idle
+            raise
+        finally:
+            session.ready.set()
+        log.info(
+            "session %s session=%s exit=%s previous=%s pool=%s country=%s ip_number=%s",
+            event,
+            session.id,
+            session.exit_id,
+            old_exit,
+            pool,
+            country,
+            session.ip_number,
+        )
         session.last_seen = time.monotonic()
         return session
 
@@ -224,13 +262,18 @@ class Hub:
             return
         del self.sessions[session.key]
         exit_id = session.exit_id
+        self._vacate(session)
+        log.info("session released session=%s exit=%s reason=%s", session.id, exit_id, reason)
+
+    def _vacate(self, session: Session) -> None:
+        """Libère la sortie de la session (à faire tourner) et coupe ses connexions."""
+        exit_id = session.exit_id
         self._unreserve(session)
         if exit_id:
             self.stale.add(exit_id)
             self.released_at[exit_id] = time.monotonic()
         for task in list(session.tasks):
             task.cancel()
-        log.info("session released session=%s exit=%s reason=%s", session.id, exit_id, reason)
 
     def release_by_id(self, session_id: str) -> bool:
         for session in list(self.sessions.values()):

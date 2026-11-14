@@ -2,7 +2,7 @@ import asyncio
 import time
 
 import pytest
-from app.hub import ExitReserved, NoFreeExit, SessionFailed
+from app.hub import ExitReserved, NoFreeExit, SessionFailed, SessionMoved
 from fakes.fake_gluetun import FakeGluetun
 
 
@@ -290,3 +290,106 @@ def test_describe_shows_sessions(multi_hub):
     assert info["label"] == "a"
     assert info["exit"] == "cg"
     assert info["release_after_seconds"] == 300
+
+
+def test_higher_ip_number_moves_to_a_free_exit(multi_hub):
+    async def scenario():
+        hub = await checked(two_exits(multi_hub)[0])
+        first = await hub.session_for("a", "vpn", None, None, 1)
+        first_exit = first.exit_id
+        again = await hub.session_for("a", "vpn", None, None, 1)
+        moved = await hub.session_for("a", "vpn", None, None, 2)
+        return hub, first, first_exit, again, moved
+
+    hub, first, first_exit, again, moved = run(scenario())
+    assert again is first and moved is first
+    assert moved.exit_id != first_exit
+    assert moved.ip_number == 2
+    assert first_exit in hub.stale
+    assert set(hub.reserved) == {moved.exit_id}
+
+
+def test_ip_number_without_other_free_exit_rotates_the_same_exit(multi_hub):
+    async def scenario():
+        hub, fakes = two_exits(multi_hub)
+        await hub.check_all()
+        await hub.session_for("other", "cyberghost", None, None)
+        await hub.session_for("a", "nordvpn", None, None, 1)
+        moved = await hub.session_for("a", "nordvpn", None, None, 2)
+        return hub, moved
+
+    hub, moved = run(scenario())
+    assert moved.exit_id == "nord"
+    assert hub.status["nord"].ip == "1.1.1.2"
+    assert "nord" not in hub.stale
+
+
+def test_many_ip_changes_never_exhaust_the_exits(multi_hub):
+    async def scenario():
+        hub = await checked(two_exits(multi_hub)[0])
+        exits = []
+        for n in range(1, 6):
+            session = await hub.session_for("a", "vpn", None, None, n)
+            exits.append(session.exit_id)
+            await hub.wait_operations()
+        other = await hub.session_for("b", "vpn", None, None)
+        return hub, exits, other
+
+    hub, exits, other = run(scenario())
+    assert all(a != b for a, b in zip(exits, exits[1:], strict=False))
+    assert len(hub.reserved) == 2
+    assert other.exit_id not in (None, exits[-1])
+
+
+def test_lower_ip_number_is_refused(multi_hub):
+    async def scenario():
+        hub = await checked(two_exits(multi_hub)[0])
+        await hub.session_for("a", "vpn", None, None, 3)
+        with pytest.raises(SessionMoved) as error:
+            await hub.session_for("a", "vpn", None, None, 2)
+        same = await hub.session_for("a", "vpn", None, None)
+        return error.value, same
+
+    error, same = run(scenario())
+    assert error.current == 3
+    assert same.ip_number == 3
+
+
+def test_ip_change_cuts_old_connections(multi_hub):
+    async def scenario():
+        hub = await checked(two_exits(multi_hub)[0])
+        session = await hub.session_for("a", "vpn", None, None, 1)
+
+        async def connection():
+            session.enter()
+            try:
+                await asyncio.sleep(10)
+            finally:
+                session.leave()
+
+        task = asyncio.create_task(connection())
+        await asyncio.sleep(0)
+        await hub.session_for("a", "vpn", None, None, 2)
+        await asyncio.gather(task, return_exceptions=True)
+        return task, session
+
+    task, session = run(scenario())
+    assert task.cancelled()
+    assert session.connections == 0
+
+
+def test_concurrent_ip_change_moves_once(multi_hub):
+    async def scenario():
+        hub = await checked(two_exits(multi_hub)[0])
+        first = await hub.session_for("a", "vpn", None, None, 1)
+        first_exit = first.exit_id
+        results = await asyncio.gather(
+            hub.session_for("a", "vpn", None, None, 2),
+            hub.session_for("a", "vpn", None, None, 2),
+        )
+        return hub, first_exit, results
+
+    hub, first_exit, (one, two) = run(scenario())
+    assert one is two
+    assert one.exit_id not in (None, first_exit)
+    assert len(hub.reserved) == 1

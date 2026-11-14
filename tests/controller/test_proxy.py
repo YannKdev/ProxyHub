@@ -21,11 +21,14 @@ def basic(user: str, password: str = "password") -> str:
 @pytest.mark.parametrize(
     ("username", "expected"),
     [
-        ("user", {"session": None, "pool": "vpn", "country": None, "hold": None}),
-        ("user-session-a1", {"session": "a1", "pool": "vpn", "country": None, "hold": None}),
+        ("user", {"session": None, "pool": "vpn", "country": None, "hold": None, "ip": None}),
         (
-            "user-pool-CyberGhost-country-BE-session-Job_7-hold-30",
-            {"session": "Job_7", "pool": "cyberghost", "country": "be", "hold": 30},
+            "user-session-a1",
+            {"session": "a1", "pool": "vpn", "country": None, "hold": None, "ip": None},
+        ),
+        (
+            "user-pool-CyberGhost-country-BE-session-Job_7-ip-4-hold-30",
+            {"session": "Job_7", "pool": "cyberghost", "country": "be", "hold": 30, "ip": 4},
         ),
     ],
 )
@@ -48,6 +51,8 @@ def test_other_user_is_not_ours(username):
         "user-country-fra",
         "user-hold-0",
         "user-hold-x",
+        "user-ip-0",
+        "user-session-a-ip-x",
         "user-session-a.b",
         "user-",
     ],
@@ -316,3 +321,19 @@ def test_plain_http_connection_ends_with_the_response(multi_hub):
     response, connections = run(scenario())
     assert response.startswith(b"HTTP/1.1 200 OK")
     assert connections == 0
+
+
+def test_ip_option_changes_the_exit(multi_hub):
+    async def scenario():
+        async with running_proxy(multi_hub) as env:
+            first = await connect_status(env, "user-session-a-ip-1")
+            again = await connect_status(env, "user-session-a-ip-1")
+            moved = await connect_status(env, "user-session-a-ip-2")
+            back = await connect_status(env, "user-session-a-ip-1")
+            return first, again, moved, back, len(env.hub.reserved)
+
+    first, again, moved, back, reserved = run(scenario())
+    assert first == again
+    assert moved[0] == 200 and moved[1] != first[1]
+    assert back == (409, None)
+    assert reserved == 1

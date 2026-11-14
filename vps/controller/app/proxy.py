@@ -39,6 +39,13 @@ class ProxyError(Exception):
         self.headers = headers or {}
 
 
+class ExitFailed(ProxyError):
+    """La sortie elle-même ne répond pas, avant tout relais : une autre peut la remplacer."""
+
+    def __init__(self, message: str):
+        super().__init__(502, message)
+
+
 @dataclass
 class Options:
     session: str | None = None
@@ -175,12 +182,23 @@ class EntryProxy:
             options = self._authenticate(request, client_ip)
             self._check_destination(request)
             session = await self._session(options, client_ip)
-            exit_id, session_id = session.exit_id or "-", session.id
-            session.enter()
-            try:
-                status = await self._forward(request, reader, writer, session)
-            finally:
-                session.leave()
+            session_id = session.id
+            for attempt in range(2):
+                exit_id = session.exit_id or "-"
+                session.enter()
+                try:
+                    status = await self._forward(request, reader, writer, session)
+                    break
+                except ExitFailed as e:
+                    # Rien encore relayé par cette sortie : en essayer une autre, une fois.
+                    # Après un relais, changer de sortie changerait l'IP en cours de route.
+                    if attempt or session.forwarded:
+                        raise
+                    failure = e
+                finally:
+                    session.leave()
+                if not await self._hub_call(self.hub.replace_exit(session, exit_id)):
+                    raise failure
         except ProxyError as e:
             status = e.status
             await self._reply(writer, e.status, str(e), e.headers)
@@ -242,11 +260,14 @@ class EntryProxy:
     async def _session(self, options: Options, client_ip: str) -> Session:
         # Sans -session-, une session par IP de client.
         name = options.session or f"ip:{client_ip}"
+        return await self._hub_call(
+            self.hub.session_for(name, options.pool, options.country, options.hold, options.ip)
+        )
+
+    async def _hub_call(self, coro):
+        """Attend le hub (réservation, changement de sortie) et traduit ses erreurs."""
         try:
-            return await asyncio.wait_for(
-                self.hub.session_for(name, options.pool, options.country, options.hold, options.ip),
-                self.settings.proxy_wait_seconds,
-            )
+            return await asyncio.wait_for(coro, self.settings.proxy_wait_seconds)
         except NoFreeExit as e:
             raise ProxyError(503, str(e), {"Retry-After": "10"}) from None
         except SessionMoved as e:
@@ -270,13 +291,16 @@ class EntryProxy:
                 UPSTREAM_TIMEOUT,
             )
         except (OSError, TimeoutError):
-            raise ProxyError(502, "exit unreachable") from None
+            raise ExitFailed("exit unreachable") from None
         try:
             if request.method == "CONNECT":
-                return await self._tunnel(request, reader, writer, up_reader, up_writer)
+                return await self._tunnel(request, reader, writer, up_reader, up_writer, session)
             up_writer.write(self._upstream_head(request))
             await up_writer.drain()
-            return await self._relay(reader, writer, up_reader, up_writer, single_response=True)
+            status = await self._relay(reader, writer, up_reader, up_writer, single_response=True)
+            if status:
+                session.forwarded = True
+            return status
         finally:
             up_writer.close()
 
@@ -287,6 +311,7 @@ class EntryProxy:
         writer: asyncio.StreamWriter,
         up_reader: asyncio.StreamReader,
         up_writer: asyncio.StreamWriter,
+        session: Session,
     ) -> int:
         up_writer.write(
             f"CONNECT {request.target} HTTP/1.1\r\nHost: {request.target}\r\n"
@@ -296,11 +321,16 @@ class EntryProxy:
         try:
             reply = await asyncio.wait_for(up_reader.readuntil(b"\r\n\r\n"), UPSTREAM_TIMEOUT)
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, TimeoutError):
-            raise ProxyError(502, "no answer from exit") from None
+            raise ExitFailed("no answer from exit") from None
         status = status_of(reply)
-        if status != 200:
+        if status in (0, 401, 407):
             # 407 de la sortie : identifiants internes refusés, pas ceux du client.
-            raise ProxyError(502 if status in (0, 401, 407) else status, f"exit answered {status}")
+            raise ExitFailed(f"exit answered {status}")
+        if status != 200:
+            # La sortie marche mais n'a pas joint l'hôte (DNS, hôte en IPv6 seulement...).
+            # Toujours 502 : un 503 se confondrait avec « plus de sortie libre ».
+            raise ProxyError(502, f"exit could not connect to {request.host} (answered {status})")
+        session.forwarded = True
         writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
         await writer.drain()
         await self._relay(reader, writer, up_reader, up_writer)
@@ -365,10 +395,14 @@ class EntryProxy:
         self, writer: asyncio.StreamWriter, status: int, message: str, headers: dict[str, str]
     ) -> None:
         body = (message + "\n").encode()
-        try:
-            phrase = HTTPStatus(status).phrase
-        except ValueError:
-            phrase = "Error"
+        # Le message sert aussi de texte de la ligne de statut : un client en CONNECT ne voit
+        # que cette ligne (requests : « Tunnel connection failed: 502 exit unreachable »).
+        phrase = " ".join(message.split())[:120].encode("ascii", "replace").decode()
+        if not phrase:
+            try:
+                phrase = HTTPStatus(status).phrase
+            except ValueError:
+                phrase = "Error"
         lines = [
             f"HTTP/1.1 {status} {phrase}",
             "Content-Type: text/plain; charset=utf-8",

@@ -88,6 +88,8 @@ class Session:
     exit_id: str | None = None
     # Option -ip-<n> : un numéro plus grand demande une IP neuve pour la même session.
     ip_number: int = 0
+    # Au moins une connexion relayée par la sortie actuelle : son IP a servi au client.
+    forwarded: bool = False
     last_seen: float = field(default_factory=time.monotonic)
     connections: int = 0
     tasks: set[asyncio.Task] = field(default_factory=set)
@@ -235,15 +237,7 @@ class Hub:
             self.sessions[key] = session
         session.ip_number = ip_number or 0
         session.idle_seconds = idle
-        try:
-            await self._assign(session)
-        except BaseException as e:
-            session.failure = e if isinstance(e, Exception) else SessionFailed("interrupted")
-            if self.sessions.get(key) is session:
-                del self.sessions[key]
-            raise
-        finally:
-            session.ready.set()
+        await self._settle(session)
         log.info(
             "session %s session=%s exit=%s previous=%s pool=%s country=%s ip_number=%s",
             event,
@@ -256,6 +250,53 @@ class Hub:
         )
         session.last_seen = time.monotonic()
         return session
+
+    async def replace_exit(self, session: Session, failed_exit: str) -> bool:
+        """Première connexion ratée sur `failed_exit` : la session passe sur une autre sortie.
+
+        Le client n'a encore rien reçu par cette sortie, donc changer d'IP ne casse rien.
+        False si aucune autre sortie n'est libre : la session garde la sienne.
+        """
+        while not session.ready.is_set():
+            await session.ready.wait()
+        if self.sessions.get(session.key) is not session or session.failure:
+            return False
+        if session.exit_id != failed_exit:
+            # Une autre connexion de la session l'a déjà déplacée.
+            return True
+        self._spawn(self._check(failed_exit))
+        exclude = frozenset({failed_exit})
+        names = country_names(session.country) if session.country else None
+        if not self._candidates(session.pool, names, exclude):
+            return False
+        self._vacate(session)
+        session.ready.clear()
+        await self._settle(session, exclude)
+        log.info(
+            "session moved session=%s exit=%s previous=%s reason=exit failed",
+            session.id,
+            session.exit_id,
+            failed_exit,
+        )
+        return True
+
+    async def _settle(self, session: Session, exclude: frozenset[str] = frozenset()) -> None:
+        """Réserve une sortie pour la session. En cas d'échec, la session disparaît et les
+        requêtes qui l'attendaient reçoivent la même erreur."""
+        try:
+            await self._assign(session, exclude)
+        except BaseException as e:
+            session.failure = e if isinstance(e, Exception) else SessionFailed("interrupted")
+            if self.sessions.get(session.key) is session:
+                del self.sessions[session.key]
+            raise
+        finally:
+            session.ready.set()
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     def release(self, session: Session, reason: str) -> None:
         if self.sessions.get(session.key) is not session:
@@ -287,14 +328,18 @@ class Hub:
             del self.reserved[session.exit_id]
         session.exit_id = None
 
-    def _candidates(self, pool: str, names: list[str] | None) -> list[str]:
-        """Sorties libres du groupe, celles utilisables tout de suite d'abord."""
+    def _candidates(
+        self, pool: str, names: list[str] | None, exclude: frozenset[str] = frozenset()
+    ) -> list[str]:
+        """Sorties libres du groupe, celles utilisables tout de suite d'abord. Une sortie
+        jamais mesurée (unknown) passe après celles vues up."""
 
-        def cost(exit_id: str) -> tuple[bool, bool, float]:
+        def cost(exit_id: str) -> tuple[bool, bool, bool, float]:
             fresh = exit_id not in self.stale
             country_ok = names is None or in_country(self.status[exit_id].country, names)
             return (
                 exit_id in self.running,
+                self.status[exit_id].state != "up",
                 not (fresh and country_ok),
                 self.released_at.get(exit_id, 0),
             )
@@ -304,29 +349,35 @@ class Hub:
             for exit_id, driver in self.exits.items()
             if pool in (driver.config.pool, driver.config.type)
             and exit_id not in self.reserved
+            and exit_id not in exclude
             and self.status[exit_id].state != "down"
         ]
         return sorted(free, key=cost)
 
-    async def _assign(self, session: Session) -> None:
+    async def _assign(self, session: Session, exclude: frozenset[str] = frozenset()) -> None:
         names = country_names(session.country) if session.country else None
-        refused: Exception | None = None
-        for exit_id in self._candidates(session.pool, names):
+        refused: list[Exception] = []
+        for exit_id in self._candidates(session.pool, names, exclude):
             if exit_id in self.reserved:
                 continue
             self.reserved[exit_id] = session
             session.exit_id = exit_id
             try:
                 await self._prepare(exit_id, names)
+                session.forwarded = False
                 return
-            except (CountryRejected, _ExitUnavailable) as e:
-                # Pays inconnu de ce fournisseur, ou sortie tombée entre-temps : la suivante.
-                refused = e
+            except (CountryRejected, _ExitUnavailable, SessionFailed) as e:
+                # Pays inconnu de ce fournisseur, sortie tombée entre-temps ou rotation
+                # ratée : la sortie suivante.
+                refused.append(e)
                 self._unreserve(session)
             except BaseException:
                 self._unreserve(session)
                 raise
-        if isinstance(refused, CountryRejected):
+        failed = [e for e in refused if isinstance(e, SessionFailed)]
+        if failed:
+            raise failed[-1]
+        if any(isinstance(e, CountryRejected) for e in refused):
             raise SessionFailed(f"country {session.country} not available in pool {session.pool}")
         raise NoFreeExit(f"no free exit in pool {session.pool}")
 

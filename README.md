@@ -110,6 +110,8 @@ print(requests.get("https://api.ipify.org", proxies=proxies, timeout=60).text)  
 - libérée après 5 min sans connexion (ou `hold`), puis la sortie tourne
 - pays absent des sorties libres : une sortie change de pays (≈ 20 s à la première connexion)
 - autant de sessions simultanées que de sorties ; IP gardée au mieux (une panne du VPN la change)
+- sortie en panne à la première connexion d'une IP : le proxy passe seul sur une autre sortie
+- le message d'erreur est aussi dans la ligne de statut (`502 exit unreachable`)
 
 | Code | Cause |
 | --- | --- |
@@ -118,7 +120,7 @@ print(requests.get("https://api.ipify.org", proxies=proxies, timeout=60).text)  
 | 403 | port autre que 80 et 443, adresse privée |
 | 407 | identifiants faux |
 | 429 | IP bloquée 30 min après 5 mauvais mots de passe (proxy et API ensemble) |
-| 502 | pays injoignable ou inconnu des sorties du groupe |
+| 502 | sortie en panne (après un relais : passer à l'`ip` suivante), hôte injoignable par la sortie (IPv6 seulement…), pays injoignable |
 | 503 | plus de sortie libre, réessayer (`Retry-After`) |
 | 504 | sortie pas prête à temps, réessayer |
 

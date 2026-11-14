@@ -263,18 +263,23 @@ def test_refused_requests(multi_hub, user, target, status):
     assert run(scenario()) == ((status, None), {})
 
 
-def test_exit_refusing_connect_gives_its_status(multi_hub):
+def test_exit_failing_to_reach_the_host_gives_502(multi_hub):
     async def scenario():
         async with running_proxy(multi_hub) as env:
             for upstream in env.upstreams.values():
-                upstream.connect_status = 504
-            gateway = await connect_status(env, "user-session-a")
+                upstream.connect_status = 503
+            status, _, _, writer, reply = await connect(env, "user-session-a")
+            writer.close()
             for upstream in env.upstreams.values():
                 upstream.connect_status = 407
             auth = await connect_status(env, "user-session-a")
-            return gateway, auth
+            return status, reply, auth
 
-    assert run(scenario()) == ((504, None), (502, None))
+    status, reply, auth = run(scenario())
+    # Jamais 503 : il veut dire « plus de sortie libre » pour le client.
+    assert status == 502
+    assert reply.startswith(b"HTTP/1.1 502 exit could not connect to example.com (answered 503)")
+    assert auth == (502, None)
 
 
 def test_unreachable_exit_gives_502(multi_hub):
@@ -337,3 +342,47 @@ def test_ip_option_changes_the_exit(multi_hub):
     assert moved[0] == 200 and moved[1] != first[1]
     assert back == (409, None)
     assert reserved == 1
+
+
+def test_first_connection_moves_to_another_exit_when_the_exit_fails(multi_hub):
+    async def scenario():
+        async with running_proxy(multi_hub) as env:
+            await env.upstreams["nord"].close()
+            status = await connect_status(env, "user-session-a")
+            [session] = env.hub.describe_sessions()
+            return status, session["exit"], "nord" in env.hub.reserved
+
+    status, exit_id, nord_reserved = run(scenario())
+    assert status == (200, "cg")
+    assert exit_id == "cg"
+    assert not nord_reserved
+
+
+def test_exit_failing_after_a_relay_keeps_the_session(multi_hub):
+    async def scenario():
+        async with running_proxy(multi_hub) as env:
+            first = await connect_status(env, "user-session-a")
+            await env.upstreams[first[1]].close()
+            status, _, _, writer, reply = await connect(env, "user-session-a")
+            writer.close()
+            return first, status, reply, env.hub.describe_sessions()[0]["exit"]
+
+    first, status, reply, exit_id = run(scenario())
+    assert status == 502
+    assert reply.startswith(b"HTTP/1.1 502 exit unreachable")
+    assert exit_id == first[1]
+
+
+def test_status_line_carries_the_message(multi_hub):
+    async def scenario():
+        async with running_proxy(multi_hub) as env:
+            _, _, _, writer, bad_option = await connect(env, "user-colour-red")
+            writer.close()
+            await connect_status(env, "user-session-a-ip-2")
+            _, _, _, writer, moved = await connect(env, "user-session-a-ip-1")
+            writer.close()
+            return bad_option, moved
+
+    bad_option, moved = run(scenario())
+    assert bad_option.startswith(b"HTTP/1.1 400 unknown proxy option 'colour'\r\n")
+    assert moved.startswith(b"HTTP/1.1 409 session already moved to ip 2, use -ip-2 or higher")

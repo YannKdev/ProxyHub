@@ -393,3 +393,58 @@ def test_concurrent_ip_change_moves_once(multi_hub):
     assert one is two
     assert one.exit_id not in (None, first_exit)
     assert len(hub.reserved) == 1
+
+
+def test_exit_never_measured_comes_after_an_exit_seen_up(multi_hub):
+    async def scenario():
+        hub, _ = two_exits(multi_hub)
+        hub.status["cg"].state = "up"
+        return await hub.session_for("a", "vpn", None, None)
+
+    assert run(scenario()).exit_id == "cg"
+
+
+def test_failed_rotation_tries_the_next_exit(multi_hub):
+    async def scenario():
+        hub, fakes = two_exits(multi_hub)
+        await hub.check_all()
+        hub.stale |= {"nord", "cg"}
+        hub.released_at |= {"nord": 1.0, "cg": 2.0}
+        fakes["nord"].connects = False
+        session = await hub.session_for("a", "vpn", None, None)
+        return hub, session
+
+    hub, session = run(scenario())
+    assert session.exit_id == "cg"
+    assert hub.status["cg"].ip == "2.2.2.2"
+    assert hub.status["nord"].state == "down"
+
+
+def test_replace_exit_moves_a_session_that_has_not_forwarded(multi_hub):
+    async def scenario():
+        hub = await checked(two_exits(multi_hub)[0])
+        session = await hub.session_for("a", "vpn", None, None)
+        failed = session.exit_id
+        moved = await hub.replace_exit(session, failed)
+        await hub.wait_operations()
+        return hub, session, failed, moved
+
+    hub, session, failed, moved = run(scenario())
+    assert moved
+    assert session.exit_id not in (None, failed)
+    assert failed in hub.stale
+
+
+def test_replace_exit_without_other_free_exit_keeps_the_exit(multi_hub):
+    async def scenario():
+        hub = await checked(two_exits(multi_hub)[0])
+        await hub.session_for("other", "vpn", None, None)
+        session = await hub.session_for("a", "vpn", None, None)
+        failed = session.exit_id
+        moved = await hub.replace_exit(session, failed)
+        await hub.wait_operations()
+        return session, failed, moved
+
+    session, failed, moved = run(scenario())
+    assert not moved
+    assert session.exit_id == failed

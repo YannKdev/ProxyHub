@@ -162,5 +162,7 @@ def test_errors(running):
 def test_wrong_proxy_password_is_refused(running):
     bad = ProxyHub(running.base_url, proxy_user="user", proxy_password="nope")
     bad.proxy_port = running.proxy_port
-    with bad.proxy() as s, pytest.raises(requests.exceptions.ProxyError):
+    with bad.proxy() as s, pytest.raises(requests.exceptions.ProxyError) as error:
         s.get("https://example.com/", timeout=10)
+    # Le texte de la ligne de statut arrive jusqu'à l'exception de requests.
+    assert "407 invalid proxy credentials" in str(error.value)

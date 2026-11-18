@@ -11,8 +11,8 @@ from typing import Any
 
 from .config import Settings
 from .countries import country_names, in_country
+from .driver import CountryRejected, ExitDriver, ExitError
 from .store import Store, utcnow
-from .vpn import CountryRejected, ExitError, VpnExit
 
 log = logging.getLogger("proxyhub")
 
@@ -125,7 +125,7 @@ class Session:
 
 
 class Hub:
-    def __init__(self, settings: Settings, exits: dict[str, VpnExit], store: Store):
+    def __init__(self, settings: Settings, exits: dict[str, ExitDriver], store: Store):
         self.settings = settings
         self.exits = exits
         self.store = store
@@ -155,7 +155,7 @@ class Hub:
         for driver in self.exits.values():
             await driver.aclose()
 
-    def driver(self, exit_id: str) -> VpnExit:
+    def driver(self, exit_id: str) -> ExitDriver:
         try:
             return self.exits[exit_id]
         except KeyError:
@@ -577,7 +577,7 @@ class Hub:
             "duration_seconds": round(time.monotonic() - started, 1),
         }
 
-    async def _wait_for_ip(self, driver: VpnExit, avoid: set[str | None]) -> str | None:
+    async def _wait_for_ip(self, driver: ExitDriver, avoid: set[str | None]) -> str | None:
         """Mesure jusqu'à obtenir une IP hors de `avoid`, ou jusqu'au délai."""
         deadline = time.monotonic() + driver.config.ready_timeout_seconds
         last_ip = None

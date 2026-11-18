@@ -6,3 +6,5 @@ __pycache__/
 .ruff_cache/
 build/
 *.egg-info/
+# Notes propres à une installation (matériel, opérateur) : jamais publiées.
+*.local.md

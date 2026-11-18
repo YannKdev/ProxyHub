@@ -1,0 +1,34 @@
+# sshd dédié au tunnel inversé du téléphone. Rien d'autre n'est permis.
+Port 2222
+HostKey /etc/ssh/keys/ssh_host_ed25519_key
+LogLevel INFO
+
+AllowUsers tunnel
+PermitRootLogin no
+AuthorizedKeysFile /etc/ssh/authorized_keys/%u
+AuthenticationMethods publickey
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+LoginGraceTime 20
+MaxAuthTries 3
+
+# Redirections inverses seulement, vers 13128 (proxy du téléphone) et 19000 (son agent).
+AllowTcpForwarding remote
+PermitListen 13128 19000
+PermitOpen none
+# Écoute sur toutes les interfaces du conteneur, pour que le contrôleur les joigne par le réseau
+# Docker. Ces ports ne sont pas publiés sur l'hôte.
+GatewayPorts yes
+# Aucune session (shell, commande, sftp) : seulement les redirections.
+MaxSessions 0
+PermitTTY no
+PermitUserRC no
+PermitTunnel no
+AllowAgentForwarding no
+AllowStreamLocalForwarding no
+X11Forwarding no
+
+# Après une coupure 4G, l'ancienne session libère ses ports en 30 s au plus, sinon la
+# reconnexion du téléphone échoue (« remote port forwarding failed »).
+ClientAliveInterval 10
+ClientAliveCountMax 3

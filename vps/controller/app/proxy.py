@@ -137,7 +137,7 @@ def status_of(head: bytes) -> int:
 
 class EntryProxy:
     """Port d'entrée unique : choisit la sortie d'après le nom d'utilisateur et relaie vers son
-    proxy (celui de Gluetun pour une sortie VPN)."""
+    proxy (celui de Gluetun pour une sortie VPN, celui du téléphone pour une sortie mobile)."""
 
     def __init__(self, hub: Hub, settings: Settings, guard: Guard):
         self.hub = hub
@@ -295,7 +295,7 @@ class EntryProxy:
         try:
             if request.method == "CONNECT":
                 return await self._tunnel(request, reader, writer, up_reader, up_writer, session)
-            up_writer.write(self._upstream_head(request))
+            up_writer.write(self._upstream_head(request, session))
             await up_writer.drain()
             status = await self._relay(reader, writer, up_reader, up_writer, single_response=True)
             if status:
@@ -313,10 +313,9 @@ class EntryProxy:
         up_writer: asyncio.StreamWriter,
         session: Session,
     ) -> int:
-        up_writer.write(
-            f"CONNECT {request.target} HTTP/1.1\r\nHost: {request.target}\r\n"
-            f"Proxy-Authorization: {self.upstream_auth}\r\n\r\n".encode("latin-1")
-        )
+        lines = [f"CONNECT {request.target} HTTP/1.1", f"Host: {request.target}"]
+        lines += self._upstream_auth(session)
+        up_writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
         await up_writer.drain()
         try:
             reply = await asyncio.wait_for(up_reader.readuntil(b"\r\n\r\n"), UPSTREAM_TIMEOUT)
@@ -336,11 +335,16 @@ class EntryProxy:
         await self._relay(reader, writer, up_reader, up_writer)
         return 200
 
-    def _upstream_head(self, request: Request) -> bytes:
+    def _upstream_auth(self, session: Session) -> list[str]:
+        if not self.hub.exits[session.exit_id].config.proxy_credentials:
+            return []
+        return [f"Proxy-Authorization: {self.upstream_auth}"]
+
+    def _upstream_head(self, request: Request, session: Session) -> bytes:
         # Une requête par connexion : le client renvoie ses identifiants à chaque connexion.
         lines = [f"{request.method} {request.target} {request.version}"]
         lines += [f"{k}: {v}" for k, v in request.headers if k.lower() not in HOP_BY_HOP]
-        lines += [f"Proxy-Authorization: {self.upstream_auth}", "Connection: close"]
+        lines += self._upstream_auth(session) + ["Connection: close"]
         return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
 
     async def _relay(

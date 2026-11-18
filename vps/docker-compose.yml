@@ -118,6 +118,21 @@ services:
       OPENVPN_KEY: ${CYBERGHOST_4_KEY:-${CYBERGHOST_KEY:-}}
       SERVER_COUNTRIES: ${CYBERGHOST_4_COUNTRIES:-${CYBERGHOST_COUNTRIES:-France}}
 
+  # Sortie mobile : le téléphone ouvre ce tunnel SSH inversé et y expose son proxy (13128) et son
+  # agent (19000). Ces deux ports restent sur le réseau Docker, seul 2222 est publié.
+  tunnel:
+    build: ./tunnel
+    restart: unless-stopped
+    logging: *logging
+    profiles:
+      - mobile-1
+    ports:
+      - "2222:2222"
+    environment:
+      TUNNEL_AUTHORIZED_KEY: ${TUNNEL_AUTHORIZED_KEY:-}
+    volumes:
+      - tunnel-keys:/etc/ssh/keys
+
   controller:
     build: ./controller
     restart: unless-stopped
@@ -166,6 +181,7 @@ volumes:
   gluetun-cyberghost-2-data:
   gluetun-cyberghost-3-data:
   gluetun-cyberghost-4-data:
+  tunnel-keys:
   controller-data:
   caddy-data:
   caddy-config:

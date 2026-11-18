@@ -1,14 +1,14 @@
 # proxyhub
 
-Passerelle proxy HTTP hébergée sur un VPS, pour faire sortir des scripts par une IP choisie. Le client utilise le VPS comme un proxy classique sur un seul port, et choisit sa sortie (NordVPN, CyberGhost, plus tard mobile 4G), son pays et sa session dans le nom d'utilisateur du proxy. Une session garde sa sortie, donc son IP ; une nouvelle session donne une autre IP. Une API d'administration montre l'état des sorties, leur historique et les sessions.
+Passerelle proxy HTTP hébergée sur un VPS, pour faire sortir des scripts par une IP choisie. Le client utilise le VPS comme un proxy classique sur un seul port, et choisit sa sortie (NordVPN, CyberGhost, téléphone Android en 4G), son pays et sa session dans le nom d'utilisateur du proxy. Une session garde sa sortie, donc son IP ; une nouvelle session donne une autre IP. Une API d'administration montre l'état des sorties, leur historique et les sessions.
 
-Le téléphone est derrière le NAT de l'opérateur : c'est le Raspberry Pi qui ouvre un tunnel vers le VPS, jamais l'inverse.
+Le téléphone est derrière le NAT de l'opérateur : c'est lui qui ouvre un tunnel SSH vers le VPS, jamais l'inverse.
 
 ```text
 scripts ──> VPS:8080 (proxy d'entrée) ──> Gluetun ──> NordVPN         vpn-1
                                       ──> Gluetun ──> CyberGhost      cyberghost-1 (facultatif)
                                       ──> Gluetun ──> CyberGhost      cyberghost-2 à -4 (facultatifs)
-                                      ──> tunnel SSH ──> Pi ──> 4G    (à venir)
+                                      ──> tunnel SSH ──> téléphone    mobile-1 (facultatif, 4G)
 admin   ──> https://<domaine> ──> Caddy ──> API : état, IP, historique, sessions
 ```
 
@@ -24,7 +24,7 @@ docker compose up -d --build
 docker compose ps
 ```
 
-Ports à ouvrir : 80 et 443 (Caddy, certificat Let's Encrypt), 8080 (proxy d'entrée). 8081 à 8083 : accès direct à une sortie, publics pendant la migration des scripts (8084 et 8085 : depuis le VPS seulement).
+Ports à ouvrir : 80 et 443 (Caddy, certificat Let's Encrypt), 8080 (proxy d'entrée), 2222 (tunnel du téléphone, si `mobile-1`). 8081 à 8083 : accès direct à une sortie, publics pendant la migration des scripts (8084 et 8085 : depuis le VPS seulement).
 
 Mise à jour (pull, vérification du `.env`, reconstruction, smoke test) :
 
@@ -71,6 +71,64 @@ done
 - pays de départ : `CYBERGHOST_COUNTRIES`, `CYBERGHOST_N_COUNTRIES` (France par défaut)
 - 7 connexions simultanées par abonnement : chaque conteneur en prend une, quel que soit le nombre de scripts derrière
 
+## Sortie mobile (téléphone Android rooté, Termux)
+
+```text
+VPS : tunnel (sshd :2222) <── ssh -R ── téléphone : Termux
+      tunnel:13128  ──> tinyproxy 127.0.0.1:8888 ──> 4G
+      tunnel:19000  ──> agent     127.0.0.1:9000 (état, plus tard rotation et réparation)
+```
+
+Root par Magisk : [guide officiel](https://topjohnwu.github.io/Magisk/install.html), section du constructeur. Il sert à la rotation (mode avion) et aux redémarrages ; proxy et tunnel marchent sans.
+
+- déverrouiller le bootloader efface le téléphone : rooter avant d'installer le reste
+- retirer les comptes du téléphone avant (protection après réinitialisation) ; aucun compte Google n'est nécessaire ensuite
+- Magisk affiche « Ramdisk » : « Non » = Magisk dans la partition recovery, un démarrage normal se fait **sans root**
+
+Réglages du téléphone :
+
+- écran de verrouillage : aucun (sinon rien ne démarre avant le premier déverrouillage après un redémarrage)
+- Wi-Fi : réseaux oubliés et Wi-Fi coupé ; données mobiles actives ; code PIN de la SIM désactivé
+- DNS privé : désactivé
+- Termux et Termux:Boot : batterie non restreinte, jamais mis en veille
+- redémarrage et mises à jour automatiques du système : désactivés
+- Magisk > Paramètres > Notification du superutilisateur : aucune (l'agent appelle `su` chaque minute)
+- toujours branché ; limite de charge si le modèle en propose une
+- Android 12 et plus : si les services de Termux meurent seuls, voir « phantom process killer » dans la doc de Termux
+
+Termux et Termux:Boot depuis F-Droid (les deux de la même source), ouvrir Termux:Boot une fois, puis dans Termux :
+
+```sh
+pkg upgrade -y && pkg install -y git
+git clone https://github.com/YannKdev/ProxyHub.git ~/proxyhub
+bash ~/proxyhub/phone/install.sh VPS          # IP ou nom du VPS ; Magisk : accorder « Toujours » à Termux
+# affiche la clé publique (ssh-ed25519 ... proxyhub-phone) ; relançable
+
+# copier la clé sur le PC sans la retaper (débogage USB, Magisk : autoriser Shell)
+adb shell su -c cat /data/data/com.termux/files/home/.config/proxyhub/id_ed25519.pub
+```
+
+Sur le VPS, dans `~/proxyhub/vps` :
+
+```sh
+ss -ltn | grep ':2222 '                       # rien : port libre
+nano .env                                     # COMPOSE_PROFILES=...,mobile-1 et TUNNEL_AUTHORIZED_KEY=<clé publique>
+./scripts/update.sh
+docker compose logs tunnel | grep -E 'ED25519|Accepted'   # empreinte de la clé d'hôte, connexions du téléphone
+```
+
+Le téléphone accepte la clé d'hôte du VPS à la première connexion. Comparer avec la ligne `ED25519` ci-dessus :
+
+```sh
+ssh-keygen -lF '[VPS]:2222' -f ~/.config/proxyhub/known_hosts   # dans Termux
+```
+
+- `-pool-mobile` seulement : le téléphone n'est jamais donné par défaut
+- pays : celui de la SIM, lu par l'agent ; `country: fr` dans `exits.yaml` pour l'imposer (SIM illisible sans root)
+- rotation : pas encore (l'agent répond 501), une session libérée laisse une rotation `failed` dans l'historique
+- tout le trafic passe deux fois par le forfait (réception, puis renvoi au VPS) ; à vide, environ 20 Mo par jour de mesures d'IP (estimation)
+- sites en IPv6 : ils voient l'IPv6 du téléphone, la mesure (`api.ipify.org`) ne donne que l'IPv4 ; l'agent montre les deux
+
 ## Proxy d'entrée
 
 Un seul compte (`PROXY_USER`, `PROXY_PASSWORD`), options dans le nom d'utilisateur.
@@ -98,7 +156,7 @@ print(requests.get("https://api.ipify.org", proxies=proxies, timeout=60).text)  
 
 | Option | Valeurs |
 | --- | --- |
-| `pool` | `nordvpn`, `cyberghost`, `vpn` (toutes les sorties VPN, par défaut), `mobile` (à venir) |
+| `pool` | `nordvpn`, `cyberghost`, `vpn` (toutes les sorties VPN, par défaut), `mobile` (le téléphone, sur demande seulement) |
 | `country` | code à deux lettres : `fr`, `be`, `de`, `gb`… |
 | `session` | 1 à 64 lettres, chiffres ou `_`, choisi par le client |
 | `ip` | numéro d'IP de la session : un numéro plus grand donne une IP neuve, un plus petit est refusé (409) |
@@ -150,6 +208,7 @@ curl -H "$H" -X POST "$API/exits/vpn-1/rotate?country=be" # code ou nom (Belgium
 curl -H "$H" -X POST "$API/exits/vpn-1/rotate?force=true" # même si une session tient la sortie
 curl -H "$H" $API/operations/<operation_id>               # résultat de la rotation
 curl -H "$H" $API/exits/vpn-1/history                     # 7 derniers jours
+curl -H "$H" $API/exits/mobile-1/agent                    # état du téléphone : IP, root, réseau, batterie
 ```
 
 - rotate : 202 + `operation_id`, `changed: false` si l'IP n'a pas bougé après `max_attempts`
@@ -204,6 +263,16 @@ docker compose restart gluetun                            # relancer le VPN (≈
 docker system df                                          # place prise par Docker
 ```
 
+Sur le téléphone (Termux) :
+
+```sh
+sv status proxyhub-proxy proxyhub-agent proxyhub-tunnel   # services runit, relancés s'ils s'arrêtent
+tail -f $PREFIX/var/log/sv/proxyhub-tunnel/current        # ou proxyhub-agent, proxyhub-proxy
+curl -s 127.0.0.1:9000/status                             # état vu par l'agent
+sv restart proxyhub-tunnel                                # reconnexion immédiate au VPS
+cd ~/proxyhub && git pull && sv restart proxyhub-agent proxyhub-proxy   # mise à jour
+```
+
 Changer un secret : modifier `.env`, puis `docker compose up -d`.
 
 - `PROXY_*` : les Gluetun et le contrôleur redémarrent (≈ 30 s de coupure), mettre à jour les clients
@@ -233,6 +302,11 @@ Après un redémarrage du VPS, tout repart seul (`restart: unless-stopped`, Dock
 - « TLS key negotiation failed » sur CyberGhost (souvent un seul pays) : liste de serveurs périmée, la mettre à jour (section CyberGhost).
 - Rotation vers un pays qui ne répond pas : la sortie revient au pays d'avant, l'opération finit en `failed` (« switched back to … »).
 - Une autre installation Gluetun utilise la même clé NordVPN : si deux conteneurs tombent sur le même serveur, l'un perd sa connexion. La reconnexion auto le répare.
+- `mobile-1` reste `down` : `docker compose logs --tail 20 tunnel` sur le VPS, puis `tail $PREFIX/var/log/sv/proxyhub-tunnel/current` sur le téléphone. « Permission denied (publickey) » : `TUNNEL_AUTHORIZED_KEY` ne correspond pas à la clé du téléphone. Rien dans les journaux du VPS : 4G coupée, port 2222 fermé, ou Termux tué (batterie non restreinte ?).
+- « remote port forwarding failed » sur le téléphone : le VPS garde l'ancienne session après une coupure, elle est libérée en 30 s au plus. Le tunnel se reconnecte seul toutes les 5 s.
+- « REMOTE HOST IDENTIFICATION HAS CHANGED » : volume `tunnel-keys` recréé sur le VPS. Vérifier l'empreinte, puis `ssh-keygen -R '[VPS]:2222' -f ~/.config/proxyhub/known_hosts` dans Termux.
+- Rien ne repart après un redémarrage du téléphone : Termux:Boot jamais ouvert, écran de verrouillage avec code, ou applications mises en veille par Android.
+- `"root": false` dans `/exits/mobile-1/agent` : Termux refusé dans Magisk, ou démarrage sans Magisk (pas de ramdisk : redémarrer avec la combinaison recovery).
 
 ## Tests
 
@@ -253,6 +327,8 @@ ruff check . && ruff format --check .
 - pas d'en-têtes de proxy ajoutés (`HTTPPROXY_STEALTH`)
 - liste des serveurs mise à jour chaque jour (`UPDATER_PERIOD`, un volume `gluetun-*-data` par Gluetun)
 - une sortie = un conteneur Gluetun + une entrée dans `vps/config/exits.yaml` (`pool`, et `profile` pour une sortie facultative)
+- tunnel du téléphone : clé seulement, redirections inverses vers 13128 et 19000 seulement, aucun shell ; ces deux ports restent sur le réseau Docker
+- proxy du téléphone sans authentification, sur 127.0.0.1 : le contrôleur ne lui envoie pas d'identifiants (tinyproxy les transmettrait au site)
 - journaux Docker : 3 × 10 Mo max par conteneur
 
 ## Licence

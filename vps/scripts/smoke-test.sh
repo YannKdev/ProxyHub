@@ -61,6 +61,23 @@ for entry in $exits_to_check; do
   [ -n "$state" ] && ok "api lists $id: $state" || fail "api exits: '$exits'"
 done
 
+# Sortie mobile : mesurée par l'API, sans session (une session libérée ferait tourner le téléphone).
+case ",${COMPOSE_PROFILES:-}," in
+  *,mobile-1,*)
+    banner=$(timeout 5 bash -c "head -c 7 < /dev/tcp/$host/2222" 2>/dev/null || true)
+    [ "$banner" = "SSH-2.0" ] && ok "tunnel answers on 2222" || fail "tunnel on 2222: '$banner'"
+    mobile_ip=$(curl -fsS --max-time 30 -H "$auth" "$api/exits/mobile-1/ip" \
+      | grep -oE '"ip":"[^"]+"' | cut -d'"' -f4 || true)
+    if [ -n "$mobile_ip" ] && [ "$mobile_ip" != "$direct_ip" ]; then
+      ok "mobile-1 exit IP: $mobile_ip"
+    else
+      fail "mobile-1 exit IP: '$mobile_ip' (phone connected?)"
+    fi
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -H "$auth" "$api/exits/mobile-1/agent" || true)
+    [ "$code" = "200" ] && ok "mobile-1 agent answers" || fail "mobile-1 agent returned $code"
+    ;;
+esac
+
 if [ -n "${API_DOMAIN:-}" ]; then
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://$API_DOMAIN/health" || true)
   [ "$code" = "200" ] && ok "api over https ($API_DOMAIN)" || fail "api over https returned $code"

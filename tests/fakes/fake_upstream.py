@@ -7,9 +7,13 @@ class FakeUpstream:
     CONNECT qui renvoie `exit=<nom>` puis l'écho de ce qu'il reçoit, et répond aux requêtes
     HTTP simples avec le nom de la sortie et la requête reçue."""
 
-    def __init__(self, name: str, user: str = "user", password: str = "password"):
+    def __init__(
+        self, name: str, user: str = "user", password: str = "password", auth: bool = True
+    ):
+        # auth=False : proxy sans authentification, comme celui du téléphone.
         self.name = name
         self.auth = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+        self.require_auth = auth
         self.connect_status = 200
         self.heads: list[str] = []
         self.port = 0
@@ -32,7 +36,7 @@ class FakeUpstream:
         try:
             head = (await reader.readuntil(b"\r\n\r\n")).decode("latin-1")
             self.heads.append(head)
-            if f"Proxy-Authorization: {self.auth}\r\n" not in head:
+            if self.require_auth and f"Proxy-Authorization: {self.auth}\r\n" not in head:
                 writer.write(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
                 return
             if head.startswith("CONNECT "):

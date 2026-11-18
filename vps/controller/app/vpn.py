@@ -3,14 +3,7 @@ import ipaddress
 import httpx
 
 from .config import Settings, VpnExitConfig
-
-
-class ExitError(Exception):
-    pass
-
-
-class CountryRejected(ExitError):
-    """Pays inconnu du fournisseur de cette sortie."""
+from .driver import CountryRejected
 
 
 class VpnExit:

@@ -16,6 +16,9 @@ main() {
   if grep -qE '^COMPOSE_PROFILES=(.*,)?cyberghost-[0-9]+(,|$)' .env; then
     required="$required CYBERGHOST_USER CYBERGHOST_PASSWORD CYBERGHOST_CERT CYBERGHOST_KEY"
   fi
+  if grep -qE '^COMPOSE_PROFILES=(.*,)?mobile-1(,|$)' .env; then
+    required="$required TUNNEL_AUTHORIZED_KEY"
+  fi
   for name in $required; do
     grep -qE "^$name=.+" .env || missing="$missing $name"
   done
@@ -26,16 +29,17 @@ main() {
 
   docker compose up -d --build
 
-  echo "waiting for the controller and for all exits to be up..."
+  echo "waiting for the controller and for all VPN exits to be up..."
   set -a
   . ./.env
   set +a
-  # Une ligne par sortie : "id état".
+  # Une ligne par sortie : "id état". Le téléphone n'est pas attendu : il peut être en rotation
+  # ou hors réseau sans que le VPS y soit pour quelque chose.
   local states=""
   for _ in $(seq 1 40); do
     states=$(curl -s -m 10 -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:8090/exits \
       | grep -oE '"(id|state)":"[^"]+"' | cut -d'"' -f4 | paste -d' ' - - || true)
-    if [ -n "$states" ] && ! echo "$states" | grep -qv ' up$'; then
+    if [ -n "$states" ] && ! echo "$states" | grep -v '^mobile-' | grep -qv ' up$'; then
       break
     fi
     sleep 5

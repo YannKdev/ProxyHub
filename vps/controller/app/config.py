@@ -1,7 +1,7 @@
 import os
 from collections.abc import Collection, Mapping
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, ClassVar, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -53,17 +53,20 @@ class Settings(BaseModel):
     proxy_wait_seconds: float = Field(default=150, gt=0)
 
 
-class VpnExitConfig(BaseModel):
+class ExitConfig(BaseModel):
+    """Réglages communs à toutes les sorties."""
+
     model_config = ConfigDict(extra="forbid")
+    # Le proxy d'entrée envoie PROXY_USER/PROXY_PASSWORD au proxy de la sortie.
+    proxy_credentials: ClassVar[bool] = True
 
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]*$")
-    type: Literal["vpn"]
     # Groupe choisi par -pool- dans le nom d'utilisateur du proxy (fournisseur).
     pool: str = Field(pattern=r"^[a-z0-9]+$")
     profile: str | None = None
-    proxy_port: int
+    # Port publié de la sortie seule, None si elle n'en a pas.
+    proxy_port: int | None = None
     proxy_url: str
-    gluetun_control_url: str
     cooldown_seconds: float = 30
     max_attempts: int = Field(default=3, ge=1)
     ready_timeout_seconds: float = 90
@@ -72,8 +75,36 @@ class VpnExitConfig(BaseModel):
     recover_interval_seconds: float = Field(default=300, gt=0)
 
 
+class VpnExitConfig(ExitConfig):
+    type: Literal["vpn"]
+    proxy_port: int
+    gluetun_control_url: str
+
+
+class MobileExitConfig(ExitConfig):
+    """Téléphone joint par le tunnel SSH qu'il ouvre lui-même vers le VPS."""
+
+    # Le proxy du téléphone n'a pas d'authentification et transmettrait l'en-tête au site.
+    proxy_credentials: ClassVar[bool] = False
+
+    type: Literal["mobile"]
+    pool: str = Field(default="mobile", pattern=r"^[a-z0-9]+$")
+    agent_url: str
+    # La sortie ne peut pas changer de pays : celui de la SIM, lu par l'agent. Un nom ou un
+    # code ISO ici l'impose.
+    country: str | None = None
+    cooldown_seconds: float = 60
+    ready_timeout_seconds: float = 180
+    poll_seconds: float = 5
+    # Le téléphone se répare lui-même : le VPS ne le joint plus quand la 4G est coupée.
+    recover_after_seconds: float | None = Field(default=None, gt=0)
+
+
+AnyExitConfig = Annotated[VpnExitConfig | MobileExitConfig, Field(discriminator="type")]
+
+
 class ExitsFile(BaseModel):
-    exits: list[VpnExitConfig]
+    exits: list[AnyExitConfig]
 
 
 def split_list(value: str) -> list[str]:
@@ -104,7 +135,7 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
         raise ConfigError(f"invalid settings: {e}") from e
 
 
-def load_exits(path: Path, profiles: Collection[str] = ()) -> list[VpnExitConfig]:
+def load_exits(path: Path, profiles: Collection[str] = ()) -> list[AnyExitConfig]:
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
         exits = ExitsFile.model_validate(data).exits

@@ -1,6 +1,6 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["vps/controller", "client", "tests"]
+pythonpath = ["vps/controller", "client", "phone/agent", "tests"]
 
 [tool.ruff]
 line-length = 100

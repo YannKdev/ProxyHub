@@ -8,20 +8,35 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, 
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from .config import ConfigError, Settings, load_exits, load_settings
+from .config import (
+    AnyExitConfig,
+    ConfigError,
+    MobileExitConfig,
+    Settings,
+    load_exits,
+    load_settings,
+)
+from .driver import ExitDriver
 from .guard import Guard
 from .hub import CooldownActive, ExitBusy, ExitReserved, Hub, UnknownExit
+from .mobile import MobileExit, make_mobile_exit
 from .proxy import EntryProxy
 from .store import Store
-from .vpn import VpnExit, make_vpn_exit
+from .vpn import make_vpn_exit
 
 log = logging.getLogger("proxyhub")
 
 Country = Annotated[str | None, Query(pattern=r"^[A-Za-z][A-Za-z .'-]{1,39}$")]
 
 
+def make_exit(config: AnyExitConfig, settings: Settings) -> ExitDriver:
+    if isinstance(config, MobileExitConfig):
+        return make_mobile_exit(config, settings)
+    return make_vpn_exit(config, settings)
+
+
 def create_app(
-    settings: Settings | None = None, exits: dict[str, VpnExit] | None = None
+    settings: Settings | None = None, exits: dict[str, ExitDriver] | None = None
 ) -> FastAPI:
     if settings is None:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -30,7 +45,7 @@ def create_app(
         settings = settings or load_settings()
         if exits is None:
             configs = load_exits(settings.exits_file, settings.compose_profiles)
-            exits = {c.id: make_vpn_exit(c, settings) for c in configs}
+            exits = {c.id: make_exit(c, settings) for c in configs}
     except ConfigError as e:
         log.error("%s", e)
         raise SystemExit(1) from None
@@ -142,6 +157,16 @@ def create_app(
         if ip is None:
             raise HTTPException(status_code=503, detail="exit unreachable")
         return {"exit": exit_id, "ip": ip}
+
+    @api.get("/exits/{exit_id}/agent")
+    async def exit_agent(exit_id: str) -> dict:
+        driver = hub.driver(exit_id)
+        if not isinstance(driver, MobileExit):
+            raise HTTPException(status_code=404, detail="not a mobile exit")
+        try:
+            return await driver.status()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail="phone agent unreachable") from e
 
     @api.post("/exits/{exit_id}/rotate", status_code=202)
     async def rotate(exit_id: str, country: Country = None, force: bool = False) -> dict:

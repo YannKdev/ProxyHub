@@ -78,5 +78,5 @@ else
 fi
 
 echo
-echo "public key, to put in TUNNEL_AUTHORIZED_KEY in vps/.env:"
-cat "$conf/id_ed25519.pub"
+echo "line to add to vps/.env:"
+echo "TUNNEL_AUTHORIZED_KEY=\"$(cat "$conf/id_ed25519.pub")\""

@@ -112,7 +112,7 @@ Sur le VPS, dans `~/proxyhub/vps` :
 
 ```sh
 ss -ltn | grep ':2222 '                       # rien : port libre
-nano .env                                     # COMPOSE_PROFILES=...,mobile-1 et TUNNEL_AUTHORIZED_KEY=<clé publique>
+nano .env                                     # COMPOSE_PROFILES=...,mobile-1 et TUNNEL_AUTHORIZED_KEY="<clé publique>" (guillemets)
 ./scripts/update.sh
 docker compose logs tunnel | grep -E 'ED25519|Accepted'   # empreinte de la clé d'hôte, connexions du téléphone
 ```

@@ -76,7 +76,7 @@ done
 ```text
 VPS : tunnel (sshd :2222) <── ssh -R ── téléphone : Termux
       tunnel:13128  ──> tinyproxy 127.0.0.1:8888 ──> 4G
-      tunnel:19000  ──> agent     127.0.0.1:9000 (état, plus tard rotation et réparation)
+      tunnel:19000  ──> agent     127.0.0.1:9000 (état, rotation par mode avion)
 ```
 
 Root par Magisk : [guide officiel](https://topjohnwu.github.io/Magisk/install.html), section du constructeur. Il sert à la rotation (mode avion) et aux redémarrages ; proxy et tunnel marchent sans.
@@ -93,6 +93,7 @@ Réglages du téléphone :
 - Termux et Termux:Boot : batterie non restreinte, jamais mis en veille
 - redémarrage et mises à jour automatiques du système : désactivés
 - Magisk > Paramètres > Notification du superutilisateur : aucune (l'agent appelle `su` chaque minute)
+- root pour Termux : Magisk 31 et plus ne demande plus rien et refuse d'office ; onglet Super-utilisateur > « + » > activer Termux (et Shell pour `adb shell su`). Versions plus anciennes : répondre « Toujours » à la fenêtre
 - toujours branché ; limite de charge si le modèle en propose une
 - Android 12 et plus : si les services de Termux meurent seuls, voir « phantom process killer » dans la doc de Termux
 
@@ -101,8 +102,8 @@ Termux et Termux:Boot depuis F-Droid (les deux de la même source), ouvrir Termu
 ```sh
 pkg upgrade -y && pkg install -y git
 git clone https://github.com/YannKdev/ProxyHub.git ~/proxyhub
-bash ~/proxyhub/phone/install.sh VPS          # IP ou nom du VPS ; Magisk : accorder « Toujours » à Termux
-# affiche la clé publique (ssh-ed25519 ... proxyhub-phone) ; relançable
+bash ~/proxyhub/phone/install.sh VPS          # IP ou nom du VPS ; root accordé à Termux avant (voir plus haut)
+# affiche la ligne TUNNEL_AUTHORIZED_KEY="..." à mettre dans vps/.env ; relançable
 
 # copier la clé sur le PC sans la retaper (débogage USB, Magisk : autoriser Shell)
 adb shell su -c cat /data/data/com.termux/files/home/.config/proxyhub/id_ed25519.pub
@@ -125,7 +126,10 @@ ssh-keygen -lF '[VPS]:2222' -f ~/.config/proxyhub/known_hosts   # dans Termux
 
 - `-pool-mobile` seulement : le téléphone n'est jamais donné par défaut
 - pays : celui de la SIM, lu par l'agent ; `country: fr` dans `exits.yaml` pour l'imposer (SIM illisible sans root)
-- rotation : pas encore (l'agent répond 501), une session libérée laisse une rotation `failed` dans l'historique
+- rotation (root) : tunnel fermé proprement, mode avion `PROXYHUB_HOLD_SECONDS` (5 s par défaut), mode avion toujours désactivé à la fin, tunnel rouvert ; l'agent répond 202 et le contrôleur attend sa fin
+- réglages de l'agent : variables `PROXYHUB_<CHAMP>` dans `~/.config/proxyhub/env` (voir `Config` dans `phone/agent/agent.py`), puis `sv restart proxyhub-agent` ; `PROXYHUB_ROTATION=none` pour désactiver
+- après une session : la sortie tourne (`trigger: release`), le client suivant a une IP neuve
+- redémarrage normal du téléphone : tout repart seul en 3 min environ (Termux:Boot est prévenu tard) ; jamais `reboot recovery` si Magisk est dans la recovery (reste bloqué sur son menu)
 - tout le trafic passe deux fois par le forfait (réception, puis renvoi au VPS) ; à vide, environ 20 Mo par jour de mesures d'IP (estimation)
 - sites en IPv6 : ils voient l'IPv6 du téléphone, la mesure (`api.ipify.org`) ne donne que l'IPv4 ; l'agent montre les deux
 
@@ -208,7 +212,8 @@ curl -H "$H" -X POST "$API/exits/vpn-1/rotate?country=be" # code ou nom (Belgium
 curl -H "$H" -X POST "$API/exits/vpn-1/rotate?force=true" # même si une session tient la sortie
 curl -H "$H" $API/operations/<operation_id>               # résultat de la rotation
 curl -H "$H" $API/exits/vpn-1/history                     # 7 derniers jours
-curl -H "$H" $API/exits/mobile-1/agent                    # état du téléphone : IP, root, réseau, batterie
+curl -H "$H" $API/exits/mobile-1/agent                    # état du téléphone : IP, root, réseau, batterie, rotation
+curl -H "$H" -X POST $API/exits/mobile-1/rotate           # mode avion, nouvelle IP mobile (pays fixe)
 ```
 
 - rotate : 202 + `operation_id`, `changed: false` si l'IP n'a pas bougé après `max_attempts`

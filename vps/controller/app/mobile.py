@@ -1,4 +1,6 @@
+import asyncio
 import ipaddress
+import time
 from typing import Any
 
 import httpx
@@ -48,8 +50,28 @@ class MobileExit:
             raise ExitError("rotation not available on this phone")
         if response.status_code == 409:
             raise ExitError("phone busy with another operation")
+        if response.status_code == 503:
+            raise ExitError("phone has no root")
         if response.status_code != 202:
             raise ExitError(f"phone agent answered {response.status_code}")
+        await self._wait_rotation(response.json()["id"])
+
+    async def _wait_rotation(self, rotation_id: str) -> None:
+        """Attend la fin de la rotation sur le téléphone. Le tunnel est coupé pendant ce temps :
+        l'agent ne répond qu'une fois le téléphone revenu sur le réseau."""
+        deadline = time.monotonic() + self.config.ready_timeout_seconds
+        while time.monotonic() < deadline:
+            await asyncio.sleep(self.config.poll_seconds)
+            try:
+                last = (await self.status())["rotation"]["last"] or {}
+            except (httpx.HTTPError, ValueError, KeyError, TypeError):
+                continue
+            if last.get("id") != rotation_id or last.get("status") == "running":
+                continue
+            if last.get("status") != "done":
+                raise ExitError(f"phone rotation failed: {last.get('error')}")
+            return
+        raise ExitError("phone did not finish its rotation in time")
 
     async def status(self) -> dict[str, Any]:
         response = await self.agent.get("/status")

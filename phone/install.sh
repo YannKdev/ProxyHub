@@ -70,11 +70,11 @@ for _ in $(seq 1 20); do
 done
 sv restart proxyhub-proxy proxyhub-agent proxyhub-tunnel || true
 
-# Magisk demande l'autorisation au premier appel : répondre « Toujours ».
+# Magisk 31 et plus refuse sans rien demander tant que Termux n'est pas autorisé dans l'appli.
 if [ "$(su -c 'id -u' 2>/dev/null)" = "0" ]; then
   echo "root: ok"
 else
-  echo "root: NOT available (grant Termux in Magisk, then run this script again)"
+  echo "root: NOT available (Magisk > Superuser > + > Termux; older Magisk: answer the prompt)"
 fi
 
 echo

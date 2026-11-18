@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 import urllib.request
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime
@@ -45,6 +46,11 @@ BATTERY_STATUS = {
     "4": "not charging",
     "5": "full",
 }
+TERMUX_PREFIX = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
+
+
+class RotationError(Exception):
+    pass
 
 
 @dataclass
@@ -57,6 +63,14 @@ class Config:
     ip_check_seconds: float = 300
     phone_check_seconds: float = 60
     su: str = "su"
+    # Rotation : "airplane" (mode avion, root nécessaire) ou "none".
+    rotation: str = "airplane"
+    hold_seconds: float = 5
+    online_timeout_seconds: float = 60
+    # Laisse partir la réponse 202 par le tunnel avant de le fermer.
+    reply_delay_seconds: float = 1
+    sv: str = "sv"
+    tunnel_service: str = f"{TERMUX_PREFIX}/var/service/proxyhub-tunnel"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] = os.environ) -> "Config":
@@ -144,6 +158,10 @@ class Agent:
         self.ip_checked_at: str | None = None
         self.offline_since: str | None = None
         self.phone: dict[str, Any] = {"root": False}
+        # Une seule opération à la fois (rotation, plus tard réparation et redémarrages).
+        self.busy = threading.Lock()
+        # Rotation en cours ou dernière rotation.
+        self.rotation: dict[str, Any] | None = None
         self._stop = threading.Event()
 
     def check_ip(self) -> None:
@@ -175,7 +193,8 @@ class Agent:
             if now >= next_phone:
                 self.check_phone()
                 next_phone = now + self.config.phone_check_seconds
-            if now >= next_ip:
+            # Pendant une opération, la coupure est voulue : pas de mesure.
+            if now >= next_ip and not self.busy.locked():
                 self.check_ip()
                 # Hors ligne : nouvel essai plus tôt.
                 wait = (
@@ -187,6 +206,102 @@ class Agent:
     def stop(self) -> None:
         self._stop.set()
 
+    def root_command(self, command: str) -> bool:
+        try:
+            done = subprocess.run(
+                [self.config.su, "-c", command], capture_output=True, timeout=30, check=False
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return done.returncode == 0
+
+    def tunnel(self, action: str) -> None:
+        """ "down" ferme proprement la session SSH : le VPS libère ses ports tout de suite, au
+        lieu de les garder jusqu'à 30 s après une coupure brutale."""
+        try:
+            subprocess.run(
+                [self.config.sv, "-w", "7", "-v", action, self.config.tunnel_service],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log.warning("tunnel %s failed: %s", action, e)
+
+    def airplane(self, enabled: bool) -> None:
+        state = "enable" if enabled else "disable"
+        # Désactiver doit réussir, sinon le téléphone reste hors réseau : plusieurs essais.
+        for attempt in range(1 if enabled else 3):
+            if attempt:
+                time.sleep(2)
+            if self.root_command(f"cmd connectivity airplane-mode {state}"):
+                return
+        raise RotationError(f"airplane mode {state} failed")
+
+    def restore(self) -> None:
+        """Au démarrage : défait une opération interrompue (agent arrêté en pleine rotation)."""
+        if self.phone.get("airplane_mode"):
+            log.warning("airplane mode left on, disabling it")
+            self.airplane(False)
+        self.tunnel("up")
+
+    def start_rotation(self) -> tuple[int, dict[str, Any]]:
+        if self.config.rotation != "airplane":
+            return 501, {"detail": "rotation disabled on this phone"}
+        if not self.phone["root"]:
+            self.check_phone()
+            if not self.phone["root"]:
+                return 503, {"detail": "root not available"}
+        if not self.busy.acquire(blocking=False):
+            return 409, {"detail": "an operation is already running"}
+        rotation = {
+            "id": uuid.uuid4().hex[:12],
+            "status": "running",
+            "started_at": utcnow(),
+            "old_ip": self.ip,
+        }
+        with self.lock:
+            self.rotation = rotation
+        threading.Thread(target=self._rotate, args=(rotation,), daemon=True).start()
+        return 202, {"id": rotation["id"]}
+
+    def _rotate(self, rotation: dict[str, Any]) -> None:
+        log.info("rotation started id=%s", rotation["id"])
+        started = time.monotonic()
+        result: dict[str, Any] = {"status": "done", "new_ip": None, "error": None}
+        try:
+            time.sleep(self.config.reply_delay_seconds)
+            self.tunnel("down")
+            try:
+                self.airplane(True)
+                time.sleep(self.config.hold_seconds)
+            finally:
+                self.airplane(False)
+            result["new_ip"] = self._wait_online()
+            if result["new_ip"] is None:
+                raise RotationError("no network after airplane mode")
+        except Exception as e:
+            result.update(status="failed", error=str(e) or type(e).__name__)
+        finally:
+            self.tunnel("up")
+            if result["new_ip"]:
+                self.check_ip()
+            result["changed"] = result["new_ip"] not in (None, rotation["old_ip"])
+            result["finished_at"] = utcnow()
+            result["duration_seconds"] = round(time.monotonic() - started, 1)
+            with self.lock:
+                rotation.update(result)
+            self.busy.release()
+            log.info("rotation %s id=%s %s", result["status"], rotation["id"], result)
+
+    def _wait_online(self) -> str | None:
+        deadline = time.monotonic() + self.config.online_timeout_seconds
+        while True:
+            ip = fetch_ip(self.config.ip_check_url, timeout=5)
+            if ip or time.monotonic() >= deadline:
+                return ip
+            time.sleep(2)
+
     def status(self) -> dict[str, Any]:
         with self.lock:
             return {
@@ -196,7 +311,11 @@ class Agent:
                 "ip_checked_at": self.ip_checked_at,
                 "offline_since": self.offline_since,
                 "phone": self.phone,
-                "rotation": "none",
+                "rotation": {
+                    "engine": self.config.rotation,
+                    "busy": self.busy.locked(),
+                    "last": dict(self.rotation) if self.rotation else None,
+                },
                 "uptime_seconds": round(time.monotonic() - self.started),
             }
 
@@ -212,7 +331,9 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(404, {"detail": "not found"})
 
     def do_POST(self) -> None:
-        if self.path in ("/rotate", "/reboot/phone", "/reboot/host"):
+        if self.path == "/rotate":
+            self.reply(*self.server.agent.start_rotation())
+        elif self.path in ("/reboot/phone", "/reboot/host"):
             self.reply(501, {"detail": "not available on this agent yet"})
         else:
             self.reply(404, {"detail": "not found"})
@@ -246,6 +367,11 @@ def main() -> None:
     # svlogd ajoute la date à chaque ligne.
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     agent = Agent(Config.from_env())
+    agent.check_phone()
+    try:
+        agent.restore()
+    except RotationError as e:
+        log.error("%s", e)
     threading.Thread(target=agent.loop, daemon=True).start()
     server = AgentServer(agent)
     log.info("agent listening on %s:%s", agent.config.host, agent.config.port)

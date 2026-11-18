@@ -155,15 +155,181 @@ def test_status(agent_url):
     assert status == 200
     assert body["phone"]["root"] is True
     assert body["phone"]["battery"]["level"] == 81
-    assert body["rotation"] == "none"
+    assert body["rotation"] == {"engine": "airplane", "busy": False, "last": None}
     assert body["online"] is None
 
 
-@pytest.mark.parametrize("path", ["/rotate", "/reboot/phone", "/reboot/host"])
-def test_operations_not_available_yet(agent_url, path):
+@pytest.mark.parametrize("path", ["/reboot/phone", "/reboot/host"])
+def test_reboots_not_available_yet(agent_url, path):
     assert call(agent_url + path, "POST")[0] == 501
 
 
 def test_unknown_routes(agent_url):
     assert call(f"{agent_url}/nope")[0] == 404
     assert call(f"{agent_url}/status", "POST")[0] == 404
+
+
+# Rotation
+
+
+class Tools:
+    """Faux su et faux sv : chaque appel est noté dans `calls` ; une commande su contenant
+    `fail` échoue."""
+
+    def __init__(self, path):
+        self.log = path / "calls"
+        self.fail = path / "fail"
+        self.fail.write_text("")
+        self.su = self._script(path / "su", "su")
+        self.sv = self._script(path / "sv", "sv")
+
+    def _script(self, path, name: str) -> str:
+        path.write_text(
+            "#!/bin/sh\n"
+            f'[ "$1" = -c ] && shift\n'
+            f'echo "{name} $*" >> {self.log}\n'
+            f'f=$(cat {self.fail}); [ -n "$f" ] && case "$*" in *"$f"*) exit 1;; esac\n'
+            "exit 0\n"
+        )
+        path.chmod(0o755)
+        return str(path)
+
+    @property
+    def calls(self) -> list[str]:
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+
+@pytest.fixture
+def rotation_agent(tmp_path):
+    """Agent rooté, rotation sans délai, service de mesure local."""
+    tools = Tools(tmp_path)
+    service = IpServer("198.51.100.8")
+    agent = Agent(
+        Config(
+            port=0,
+            su=tools.su,
+            sv=tools.sv,
+            tunnel_service="/svc/tunnel",
+            hold_seconds=0,
+            reply_delay_seconds=0,
+            online_timeout_seconds=0,
+            ip_check_url=service.url,
+            ip6_check_url=service.url,
+        )
+    )
+    agent.phone = {"root": True}
+    agent.ip = "198.51.100.7"
+    yield agent, tools, service
+    service.server.shutdown()
+
+
+def finish(agent: Agent) -> dict:
+    deadline = threading.Event()
+    for _ in range(100):
+        if not agent.busy.locked():
+            break
+        deadline.wait(0.05)
+    return agent.status()["rotation"]["last"]
+
+
+AIRPLANE = "su cmd connectivity airplane-mode"
+
+
+def test_rotation_cycles_airplane_mode(rotation_agent):
+    agent, tools, _ = rotation_agent
+    status, body = agent.start_rotation()
+    last = finish(agent)
+
+    assert status == 202
+    assert tools.calls == [
+        "sv -w 7 -v down /svc/tunnel",
+        f"{AIRPLANE} enable",
+        f"{AIRPLANE} disable",
+        "sv -w 7 -v up /svc/tunnel",
+    ]
+    assert last["id"] == body["id"]
+    assert (last["status"], last["old_ip"], last["new_ip"]) == (
+        "done",
+        "198.51.100.7",
+        "198.51.100.8",
+    )
+    assert last["changed"] is True
+    assert agent.ip == "198.51.100.8"
+
+
+def test_airplane_mode_is_always_disabled(rotation_agent):
+    agent, tools, _ = rotation_agent
+    tools.fail.write_text("enable")
+    agent.start_rotation()
+    last = finish(agent)
+
+    assert (last["status"], last["error"]) == ("failed", "airplane mode enable failed")
+    assert tools.calls[-2:] == [f"{AIRPLANE} disable", "sv -w 7 -v up /svc/tunnel"]
+
+
+def test_disabling_airplane_mode_is_retried(rotation_agent, monkeypatch):
+    agent, tools, _ = rotation_agent
+    monkeypatch.setattr("agent.time.sleep", lambda seconds: None)
+    tools.fail.write_text("disable")
+    agent.start_rotation()
+    last = finish(agent)
+
+    assert last["error"] == "airplane mode disable failed"
+    assert tools.calls.count(f"{AIRPLANE} disable") == 3
+    assert tools.calls[-1] == "sv -w 7 -v up /svc/tunnel"
+
+
+def test_no_network_after_rotation(rotation_agent):
+    agent, tools, service = rotation_agent
+    service.ip = ""
+    agent.start_rotation()
+    last = finish(agent)
+
+    assert (last["status"], last["error"]) == ("failed", "no network after airplane mode")
+    assert last["changed"] is False
+    assert tools.calls[-1] == "sv -w 7 -v up /svc/tunnel"
+
+
+def test_one_operation_at_a_time(rotation_agent):
+    agent, _, _ = rotation_agent
+    agent.config.hold_seconds = 0.5
+    assert agent.start_rotation()[0] == 202
+    assert agent.start_rotation()[0] == 409
+    finish(agent)
+    assert agent.start_rotation()[0] == 202
+    finish(agent)
+
+
+def test_rotation_needs_root(rotation_agent):
+    agent, tools, _ = rotation_agent
+    agent.phone = {"root": False}
+    assert agent.start_rotation()[0] == 503
+    assert not any(call.startswith(AIRPLANE) for call in tools.calls)
+
+
+def test_rotation_disabled(rotation_agent):
+    agent, _, _ = rotation_agent
+    agent.config.rotation = "none"
+    assert agent.start_rotation()[0] == 501
+
+
+def test_restore_after_an_interrupted_rotation(rotation_agent):
+    agent, tools, _ = rotation_agent
+    agent.phone = {"root": True, "airplane_mode": True}
+    agent.restore()
+    assert tools.calls == [f"{AIRPLANE} disable", "sv -w 7 -v up /svc/tunnel"]
+
+
+def test_rotate_over_http(rotation_agent):
+    agent, _, _ = rotation_agent
+    server = AgentServer(agent)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    status, body = call(f"{url}/rotate", "POST")
+    finish(agent)
+    _, state = call(f"{url}/status")
+    server.shutdown()
+
+    assert status == 202
+    assert state["rotation"]["last"]["id"] == body["id"]
+    assert state["rotation"]["busy"] is False

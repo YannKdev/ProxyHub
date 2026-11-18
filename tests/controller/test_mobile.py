@@ -98,7 +98,50 @@ def test_rotation_asks_the_phone(settings):
     assert op["status"] == "done"
     assert [op["result"]["old_ip"], op["result"]["new_ip"]] == PHONE_IPS[:2]
     assert op["result"]["country"] == "France"
+    assert op["result"]["attempts"] == 1
     assert ("POST", "/rotate") in agent.requests
+
+
+def test_rotation_waits_for_the_phone_through_the_outage(settings):
+    agent = FakeAgent(PHONE_IPS, down_requests=4)
+    op = rotate(make_hub(settings, {"mobile-1": mobile_exit(agent, ready_timeout_seconds=1)}))
+
+    assert (op["status"], op["result"]["new_ip"]) == ("done", PHONE_IPS[1])
+    assert agent.rotation["status"] == "done"
+
+
+def test_same_ip_after_rotation_does_not_wait_for_the_timeout(settings):
+    # Le téléphone a fini sa rotation : la même IP est définitive, pas la peine d'attendre.
+    agent = FakeAgent(PHONE_IPS[:1])
+    hub = make_hub(settings, {"mobile-1": mobile_exit(agent, ready_timeout_seconds=30)})
+    op = rotate(hub)
+
+    assert op["status"] == "done"
+    assert (op["result"]["changed"], op["result"]["attempts"]) == (False, 3)
+    assert op["result"]["duration_seconds"] < 5
+    assert agent.rotations == 3
+
+
+def test_failed_phone_rotation(settings):
+    agent = FakeAgent(PHONE_IPS, rotation_error="no network after airplane mode")
+    op = rotate(make_hub(settings, {"mobile-1": mobile_exit(agent)}))
+
+    assert op["status"] == "failed"
+    assert op["error"] == "phone rotation failed: no network after airplane mode"
+
+
+@pytest.mark.parametrize(
+    ("code", "error"), [(409, "phone busy with another operation"), (503, "phone has no root")]
+)
+def test_phone_refusing_a_rotation(settings, code, error):
+    op = rotate(make_hub(settings, {"mobile-1": mobile_exit(FakeAgent(PHONE_IPS, code))}))
+    assert (op["status"], op["error"]) == ("failed", error)
+
+
+def test_phone_never_finishing_its_rotation(settings):
+    agent = FakeAgent(PHONE_IPS, down_requests=10_000)
+    op = rotate(make_hub(settings, {"mobile-1": mobile_exit(agent, ready_timeout_seconds=0.1)}))
+    assert op["error"] == "phone did not finish its rotation in time"
 
 
 def test_country_read_once_from_the_sim():

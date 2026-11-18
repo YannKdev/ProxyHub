@@ -578,7 +578,8 @@ class Hub:
         }
 
     async def _wait_for_ip(self, driver: ExitDriver, avoid: set[str | None]) -> str | None:
-        """Mesure jusqu'à obtenir une IP hors de `avoid`, ou jusqu'au délai."""
+        """Mesure jusqu'à obtenir une IP hors de `avoid`, ou jusqu'au délai. Si la sortie a fini
+        de changer d'IP quand reconnect() rend la main (téléphone), la première IP suffit."""
         deadline = time.monotonic() + driver.config.ready_timeout_seconds
         last_ip = None
         while True:
@@ -588,7 +589,7 @@ class Hub:
                 ip = None
             if ip:
                 last_ip = ip
-                if ip not in avoid:
+                if ip not in avoid or driver.config.reconnect_settles:
                     return ip
             if time.monotonic() >= deadline:
                 return last_ip

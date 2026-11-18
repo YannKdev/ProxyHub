@@ -59,6 +59,9 @@ class ExitConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     # Le proxy d'entrée envoie PROXY_USER/PROXY_PASSWORD au proxy de la sortie.
     proxy_credentials: ClassVar[bool] = True
+    # reconnect() rend la main une fois la nouvelle IP en place : la première IP mesurée
+    # ensuite est la bonne. Sinon (Gluetun), on mesure jusqu'à voir une autre IP.
+    reconnect_settles: ClassVar[bool] = False
 
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]*$")
     # Groupe choisi par -pool- dans le nom d'utilisateur du proxy (fournisseur).
@@ -86,6 +89,8 @@ class MobileExitConfig(ExitConfig):
 
     # Le proxy du téléphone n'a pas d'authentification et transmettrait l'en-tête au site.
     proxy_credentials: ClassVar[bool] = False
+    # reconnect() attend la fin de la rotation sur le téléphone.
+    reconnect_settles: ClassVar[bool] = True
 
     type: Literal["mobile"]
     pool: str = Field(default="mobile", pattern=r"^[a-z0-9]+$")
